@@ -41,4 +41,4 @@ docker/
 
 - [ ] `docker-compose.yml`
 - [ ] `.env.example`
-- [ ] WSL2 `.wslconfig` 内存上限模板（建议 `memory=12GB`）
+- [x] WSL2 `.wslconfig` 内存上限（`memory=10GB`，见 `docs/04-环境搭建.md` §4）
