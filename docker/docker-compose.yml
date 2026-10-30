@@ -13,7 +13,7 @@
 #   docker compose --profile source down             停止（保留数据卷）
 #   docker compose --profile source down -v          连数据一起删（慎用）
 #
-# 当前只写了 mysql：kafka 在 P2 第 5 步（埋点链路）时补上，避免写一堆没验证过的配置。
+# 当前写了 mysql + kafka。flink / doris 等到各自阶段再加，避免堆一堆没验证过的配置。
 # =============================================================================
 
 services:
@@ -73,3 +73,56 @@ services:
       retries: 24
       start_period: 30s
     mem_limit: ${MYSQL_MEM_LIMIT:-768m}
+
+  # ---------------------------------------------------------------------------
+  # Kafka 3.7.1 —— KRaft 单节点（不装 ZooKeeper，省一个容器和 1GB 内存）
+  # ---------------------------------------------------------------------------
+  # 两个 listener 不是多余配置。Kafka 返回给客户端的是 advertised 地址，
+  # 客户端拿到后会**再连一次**，所以：
+  #   - 容器内的客户端（Flink）必须拿到 kafka:9092，走 docker 网络
+  #   - 宿主机上的客户端（Python 生成器）必须拿到 localhost:29092
+  # 只配一个的话，必然有一边连不上，典型现象是「producer 连上了但一直超时，
+  # 日志里出现 Connection to node -1 could not be established」。
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: rt-kafka
+    profiles: ["source"]
+    restart: unless-stopped
+    ports:
+      # 只映射 EXTERNAL，9092 留在容器网络内，宿主机不暴露，避免误连
+      - "${KAFKA_EXTERNAL_PORT:-29092}:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # 三个 partition：给 Flink 留并行度。按 session_id 做 key，
+      # 同一会话的事件落在同一分区，分区内有序 —— 漏斗按 session 归因依赖这一点。
+      KAFKA_NUM_PARTITIONS: 3
+      # 关掉自动建 topic：topic 名打错时立刻报错，而不是悄悄建一个空 topic
+      # 让人以为「生产成功了」
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # 默认堆是 1G，会顶到 768m 的 cgroup 上限；显式压到 512m
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+      TZ: Asia/Shanghai
+    volumes:
+      # 和 mysql 一样用 bind mount（实测 Docker Desktop 的 Windows 挂载是 0777，
+      # appuser uid=1000 可写）。不用 named volume 是为了让数据目录都在仓库里，
+      # 备份和查看都不用进 WSL。
+      - ./volumes/kafka:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    mem_limit: ${KAFKA_MEM_LIMIT:-768m}

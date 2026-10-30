@@ -1,0 +1,4 @@
+# gen_user_events.py --sink kafka 需要
+# 用 ng 分支而不是 kafka-python 1.4.7：后者不支持 Python 3.12+，
+# 且在 Kafka 3.x 上会遇到 UnknownApiVersion 之类的协议问题。
+kafka-python-ng>=2.2,<3

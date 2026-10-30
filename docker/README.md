@@ -7,7 +7,7 @@
 | 服务 | profile | 内存 limit | 端口 | 说明 |
 | --- | --- | --- | --- | --- |
 | `mysql` | `source` | 768 MB | 3306 | 业务库，开启 binlog（`ROW` + `FULL`） |
-| `kafka` | `source` | 768 MB | 9092 | KRaft 单节点，免 ZooKeeper |
+| `kafka` | `source` | 768 MB | **29092**（宿主）/ 9092（容器内） | KRaft 单节点，免 ZooKeeper |
 | `flink-jobmanager` | `compute` | 768 MB | 8081 | Web UI |
 | `flink-taskmanager` | `compute` | 2 GB | — | 2 slots，RocksDB 状态后端 |
 | `doris-fe` | `olap` | 1.5 GB | 8030 / 9030 | Web UI / MySQL 协议端口 |
@@ -15,7 +15,18 @@
 
 合计约 **8.8 GB**，WSL 上限 10GB（`docs/04` §4），余量约 1.2GB 留给内核与 dockerd。
 
-`kafka-ui`（256 MB / 8080）暂不启用：用 `docker exec kafka kafka-console-consumer.sh` 查积压即可，省一个容器。
+`kafka-ui`（256 MB / 8080）暂不启用：用 `kafka-console-consumer.sh` 查积压即可，省一个容器。
+
+### Kafka 为什么有两个端口
+
+Kafka 返回给客户端的是 `advertised.listeners`，客户端拿到后会**再连一次**。所以两边必须各有一个：
+
+| 客户端位置 | 使用地址 | 对应配置 |
+| --- | --- | --- |
+| 宿主机（Python 生成器） | `localhost:29092` | `EXTERNAL`，映射到宿主机 |
+| 容器内（Flink 作业） | `kafka:9092` | `PLAINTEXT`，只在 docker 网络内 |
+
+只配一个的典型症状：producer 显示连上，但随后一直超时，日志里是 `Connection to node -1 could not be established`。9092 刻意不映射到宿主机，避免误连到错误地址。
 
 ## 启动顺序
 
@@ -33,13 +44,27 @@ docker compose --profile olap    up -d    # 最后起 Doris
 docker/
 ├── docker-compose.yml
 ├── .env.example          # 端口、密码等可覆盖变量（.env 本身不入库）
-├── mysql/init/           # 容器首次启动自动执行的建表与初始化 SQL
-├── flink/conf/           # flink-conf.yaml 覆盖项
-└── doris/                # FE/BE 自定义配置
+├── volumes/              # 数据目录：mysql/、kafka/（整目录不入库）
+├── flink/conf/           # flink-conf.yaml 覆盖项（待建）
+└── doris/                # FE/BE 自定义配置（待建）
+```
+
+建表 SQL 不放在 `docker/` 下，而是仓库根的 `sql/mysql/`：它同时被 compose 挂进容器（首次启动自动执行）和手工导入流程使用，放在通用位置才不用两头维护。`docker/mysql/init/` 这个方案已经弃用。
+
+## 数据流
+
+```
+                    ┌─ mysql:3306 ──binlog(ROW/FULL)──┐
+Olist CSV ──load──▶ │                                 │──▶ Flink CDC ──▶ Doris ODS
+                    └─ kafka:29092 ──user_event───────┘
+                          ▲
+      scripts/gen_user_events.py（合成埋点，3 分区，key=session_id）
 ```
 
 ## 待补充
 
-- [ ] `docker-compose.yml`
-- [ ] `.env.example`
+- [x] `docker-compose.yml`（mysql + kafka 已实测跑通）
+- [x] `.env.example`
 - [x] WSL2 `.wslconfig` 内存上限（`memory=10GB`，见 `docs/04-环境搭建.md` §4）
+- [ ] `flink-jobmanager` / `flink-taskmanager` 服务定义（P3）
+- [ ] `doris-fe` / `doris-be` 服务定义（P3）
