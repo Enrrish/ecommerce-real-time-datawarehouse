@@ -1,0 +1,75 @@
+# =============================================================================
+# 电商实时数仓 —— 容器编排
+# -----------------------------------------------------------------------------
+# 分三个 profile，按阶段起，不要一次全起（内存只有 10GB，见 docs/04 §4）：
+#   source  : mysql + kafka        数据源
+#   compute : flink-jobmanager/taskmanager
+#   olap    : doris-fe + doris-be  单独起，BE 初始化会预占大块内存
+#
+# 常用命令（在 docker/ 目录下执行）：
+#   docker compose --profile source up -d mysql      只起 MySQL
+#   docker compose --profile source ps               看状态
+#   docker compose --profile source logs -f mysql    看日志
+#   docker compose --profile source down             停止（保留数据卷）
+#   docker compose --profile source down -v          连数据一起删（慎用）
+#
+# 当前只写了 mysql：kafka 在 P2 第 5 步（埋点链路）时补上，避免写一堆没验证过的配置。
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MySQL 8.0.36 —— 业务库（贴源层的源系统）
+  # ---------------------------------------------------------------------------
+  # 四个启动参数不是可选项，缺一个 CDC 就静默失效：
+  #   binlog-format=ROW      记录行变更而非 SQL 文本，CDC 必需
+  #   binlog-row-image=FULL  记录变更前后完整行，缺它拿不到 DELETE 前的值
+  #   server-id=1            binlog 协议要求，集群内唯一
+  #   log_bin                8.0 默认开启，此处不显式关，靠下面的校验确认
+  # 另外 secure-file-priv 指向挂载的导入目录，LOAD DATA INFILE 才能读 /load 下的文件。
+  mysql:
+    image: mysql:8.0.36
+    container_name: rt-mysql
+    profiles: ["source"]
+    restart: unless-stopped
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-root123}"
+      MYSQL_DATABASE: olist
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --server-id=1
+      - --innodb-buffer-pool-size=256M
+      - --secure-file-priv=/load
+      # 关掉客户端 LOCAL 上传通道：数据由 prepare_load.py 预处理好后走服务端读取，
+      # 这样导入过程不依赖宿主机与容器的文件传输，也少一个安全面
+      - --local-infile=0
+    volumes:
+      # 数据目录：必须在 D 盘的仓库内，否则 down 一次数据就没了
+      - ./volumes/mysql:/var/lib/mysql
+      # 首次初始化（数据目录为空时）自动执行建表脚本。
+      # 单文件挂载 + 10- 前缀，确保只有 schema 会被执行；
+      # 02-verify 和 03-load 是手动跑的，不能被 entrypoint 顺带执行。
+      - ../sql/mysql/01-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      # 预处理后的 TSV 导入目录，对应 --secure-file-priv=/load
+      #
+      # 这里刻意不加 :ro —— 不是疏忽。MySQL 的 entrypoint 会解析
+      # `mysqld --verbose --help` 的输出，把 secure-file-priv 指向的目录当作
+      # 「必须属主为 mysql 的目录」，无条件执行 mkdir -p 后递归 chown：
+      #   find "${!dirs[@]}" \! -user mysql -exec chown --no-dereference mysql '{}' +
+      # 挂成只读时 chown 报 "Read-only file system"，而 entrypoint 头部是
+      # `set -eo pipefail`，容器会在 mysqld 启动之前就以 exit 1 退出，
+      # 日志里只有一行 Entrypoint started + 一屏 chown 报错，很难联想到是挂载选项。
+      - ../build/load:/load
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root123}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    mem_limit: ${MYSQL_MEM_LIMIT:-768m}

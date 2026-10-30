@@ -57,9 +57,18 @@ SELECT 'orders.customer_date 应为 2965',              COUNT(*) - 2965         
 UNION ALL
 SELECT 'products.category 应为 610',                  COUNT(*) - 610               FROM `products`       WHERE `product_category_name`         IS NULL
 UNION ALL
-SELECT 'reviews.title 应为 87658',                    COUNT(*) - 87658             FROM `order_reviews`  WHERE `review_comment_title`          IS NULL
+-- 评论的两个空值数比「看着空」的条数少 2 和 27，这不是偏差，是有意的口径：
+-- 源文件里有 2 条 title 是单个空格、27 条 message 是 \r\n 序列，prepare_load.py
+-- 只把「严格空串」转成 NULL，这些纯空白值原样保留。ODS 的职责是照收，
+-- 把「trim 后为空」归一成 NULL 属于清洗，放在 DWD 做（见 docs/02 §4）。
+-- 所以下面除了核对 NULL 数，还反向断言这 29 条确实还在。
+SELECT 'reviews.title 应为 87656',                    COUNT(*) - 87656             FROM `order_reviews`  WHERE `review_comment_title`          IS NULL
 UNION ALL
-SELECT 'reviews.message 应为 58274',                   COUNT(*) - 58274             FROM `order_reviews`  WHERE `review_comment_message`        IS NULL;
+SELECT 'reviews.message 应为 58247',                   COUNT(*) - 58247             FROM `order_reviews`  WHERE `review_comment_message`        IS NULL
+UNION ALL
+SELECT 'reviews.title 纯空白应保留 2 条',              COUNT(*) - 2                 FROM `order_reviews`  WHERE `review_comment_title`   IS NOT NULL AND TRIM(`review_comment_title`)   = ''
+UNION ALL
+SELECT 'reviews.message 纯空白应保留 27 条',           COUNT(*) - 27                FROM `order_reviews`  WHERE `review_comment_message` IS NOT NULL AND TRIM(REPLACE(REPLACE(`review_comment_message`, '\r', ''), '\n', '')) = '';
 
 
 -- -----------------------------------------------------------------------------
