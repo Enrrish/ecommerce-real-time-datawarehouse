@@ -4,17 +4,18 @@
 
 ## 服务清单
 
-| 服务 | profile | 内存上限 | 端口 | 说明 |
+| 服务 | profile | 内存 limit | 端口 | 说明 |
 | --- | --- | --- | --- | --- |
-| `mysql` | `source` | 1 GB | 3306 | 业务库，开启 binlog（`ROW` + `FULL`） |
-| `kafka` | `source` | 1 GB | 9092 | KRaft 单节点，免 ZooKeeper |
-| `kafka-ui` | `source` | 256 MB | 8080 | 可选，查看 topic 与消费积压 |
-| `flink-jobmanager` | `compute` | 1 GB | 8081 | Web UI |
-| `flink-taskmanager` | `compute` | 3 GB | — | 2 slots，RocksDB 状态后端 |
-| `doris-fe` | `olap` | 2 GB | 8030 / 9030 | Web UI / MySQL 协议端口 |
-| `doris-be` | `olap` | 4 GB | 8040 | 单 BE，`replication_num=1` |
+| `mysql` | `source` | 768 MB | 3306 | 业务库，开启 binlog（`ROW` + `FULL`） |
+| `kafka` | `source` | 768 MB | 9092 | KRaft 单节点，免 ZooKeeper |
+| `flink-jobmanager` | `compute` | 768 MB | 8081 | Web UI |
+| `flink-taskmanager` | `compute` | 2 GB | — | 2 slots，RocksDB 状态后端 |
+| `doris-fe` | `olap` | 1.5 GB | 8030 / 9030 | Web UI / MySQL 协议端口 |
+| `doris-be` | `olap` | 3 GB | 8040 | 单 BE，`replication_num=1` |
 
-合计约 **12 GB**，为本机 16GB 内存留出系统余量。
+合计约 **8.8 GB**，WSL 上限 10GB（`docs/04` §4），余量约 1.2GB 留给内核与 dockerd。
+
+`kafka-ui`（256 MB / 8080）暂不启用：用 `docker exec kafka kafka-console-consumer.sh` 查积压即可，省一个容器。
 
 ## 启动顺序
 
