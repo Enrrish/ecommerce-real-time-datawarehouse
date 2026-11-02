@@ -136,7 +136,7 @@ services:
   # ---------------------------------------------------------------------------
   # Flink 1.18.1 —— session 集群（JM + TM 分离）
   # ---------------------------------------------------------------------------
-  # 三个 connector jar 必须**逐个文件**挂载到 /opt/flink/lib/，不能挂整个目录：
+  # 四个 jar（3 connector + 1 JDBC 驱动）必须**逐个文件**挂载到 /opt/flink/lib/，不能挂整个目录：
   #   挂目录会用宿主机的空目录覆盖镜像自带的 /opt/flink/lib（里面是 flink-dist、
   #   log4j 等核心包），结果是集群起来就报 ClassNotFoundException，且日志指向
   #   一个"找不到 org.apache.flink.runtime.taskexecutor.TaskManagerRunner"这种
@@ -175,9 +175,12 @@ services:
         web.upload.enabled: false
     volumes:
       - ../flink/checkpoints:/opt/flink/checkpoints
-      - ../flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:ro
-      - ../flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
-      - ../flink/lib/flink-doris-connector-1.18-24.0.1.jar:/opt/flink/lib/flink-doris-connector-1.18-24.0.1.jar:ro
+      - ./flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:ro
+      - ./flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
+      - ./flink/lib/flink-doris-connector-1.18-24.0.1.jar:/opt/flink/lib/flink-doris-connector-1.18-24.0.1.jar:ro
+      # MySQL JDBC 驱动：connector 的 fat jar 因 GPLv2 不含它，缺了会在 TM 连库
+      # 那一刻抛 ClassNotFoundException: com.mysql.cj.jdbc.Driver
+      - ./flink/lib/mysql-connector-java-8.0.27.jar:/opt/flink/lib/mysql-connector-java-8.0.27.jar:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8081/overview >/dev/null 2>&1 || exit 1"]
       interval: 10s
@@ -217,9 +220,10 @@ services:
         taskmanager.memory.network.max: 128m
     volumes:
       - ../flink/checkpoints:/opt/flink/checkpoints
-      - ../flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:ro
-      - ../flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
-      - ../flink/lib/flink-doris-connector-1.18-24.0.1.jar:/opt/flink/lib/flink-doris-connector-1.18-24.0.1.jar:ro
+      - ./flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:ro
+      - ./flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
+      - ./flink/lib/flink-doris-connector-1.18-24.0.1.jar:/opt/flink/lib/flink-doris-connector-1.18-24.0.1.jar:ro
+      - ./flink/lib/mysql-connector-java-8.0.27.jar:/opt/flink/lib/mysql-connector-java-8.0.27.jar:ro
     mem_limit: ${FLINK_TM_MEM_LIMIT:-2560m}
     networks:
       rt-net:

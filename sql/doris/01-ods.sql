@@ -54,9 +54,18 @@
 --   * 时间 DATETIME，不用 TIMESTAMP（时区换算 + 2038 溢出，CDC 后会整体偏 8 小时）
 --   * 邮编 VARCHAR(5) 而不是 CHAR(5)：Doris 的 CHAR 会补空格，
 --     比较时依赖隐式 rtrim，把「字符串」语义变成「定长字符」语义，没必要
---   * op 取值 c/u/d/r（Flink CDC 的 op 元数据列）。UNIQUE 模型下
---     op='d' 的那次变更会把行删掉，所以表里最终只会看到 c/u/r，
---     删除痕迹在 binlog 与 Kafka 里，不在 ODS（docs/02 §5.2 已如此约定）
+--
+-- 关于 ts_ms = 0：**快照行的 ts_ms 是有意的 0，不代表 1970 年**。
+--   首轮全量扫表时没有对应的 binlog 事件，Flink CDC 给的 op_ts 是 epoch 0。
+--   保留 0 作为哨兵，语义是「这一行没有源端时间戳」，比编一个假时间诚实。
+--   所以任何基于 ts_ms 的指标都必须带 WHERE ts_ms > 0。
+--   同时 dt 不能取 DATE(op_ts)：那样首轮全量后 155 万行会全部落进 1970-01-01，
+--   DWD 一旦按 dt 做动态分区（start=-30），整个历史分区会被当场 DROP 掉，
+--   而 ODS 看起来「数据都在」。这就是 dt 取 CURRENT_DATE（落地日）的原因。
+--   * op 取值 c/u/x（由 Flink 的 row_kind 映射：+I→c、+U/-U→u、-D→d）。
+--     UNIQUE 模型下 op='d' 的那次变更会把行直接删掉，所以表里最终只会看到 c/u，
+--     删除痕迹在 binlog 与 Kafka 里，不在 ODS（docs/02 §5.2 已如此约定）。
+--     **快照行也是 c，不是 r** —— 这一点被实测纠正过，详见 02-verify.sql 检查 2。
 -- =============================================================================
 
 CREATE DATABASE IF NOT EXISTS `realtime_dw`;
@@ -76,8 +85,8 @@ CREATE TABLE IF NOT EXISTS `ods_customers` (
   `customer_city`            VARCHAR(64) NOT NULL COMMENT '实测最大 40 字节',
   `customer_state`           VARCHAR(2)  NOT NULL,
   `op`                       VARCHAR(1)  NOT NULL COMMENT 'c/u/d/r',
-  `ts_ms`                    BIGINT      NOT NULL COMMENT 'binlog 事件时间（毫秒）',
-  `dt`                       DATE        NOT NULL COMMENT '变更日期 DATE(ts_ms)'
+  `ts_ms`                    BIGINT      NOT NULL COMMENT 'binlog 事件时间（毫秒）；快照行为 0，见文件头说明',
+  `dt`                       DATE        NOT NULL COMMENT '落地日期 CURRENT_DATE（不是源端变更日）'
 ) ENGINE = OLAP
 UNIQUE KEY(`customer_id`)
 COMMENT '客户：99,441 行 / 96,096 个自然人'
@@ -300,8 +309,10 @@ PROPERTIES (
 --
 -- event_time 用 DATETIME(3) 保留毫秒：生成器输出到毫秒，漏斗按秒聚合时
 -- 毫秒决定了同一秒内事件的先后，丢精度会让「加购早于浏览」这类脏数据出现。
--- dt 取 DATE(event_time) 而不是变更日期：埋点的事件时间本身就是业务时间，
--- 也是大屏按天聚合的分区依据（与另外 9 张表取 DATE(ts_ms) 不同，见下方注释）。
+-- dt 取 DATE(event_time) 而不是落库日期：埋点的事件时间本身就是业务时间，
+-- 也是大屏按天聚合的分区依据。这是**唯一**一张 dt 取业务日期的表 ——
+-- 另外 9 张 CDC 表的 dt 取 CURRENT_DATE（落地日），因为它们的快照行没有
+-- 可信的源端时间戳（见文件头「关于 ts_ms = 0」）。
 CREATE TABLE IF NOT EXISTS `ods_user_event` (
   `event_id`       VARCHAR(36)  NOT NULL COMMENT 'uuid，幂等键',
   `event_time`     DATETIME(3)  NOT NULL COMMENT '事件时间，Asia/Shanghai',

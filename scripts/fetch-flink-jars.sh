@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 # =============================================================================
-# fetch-flink-jars.sh — 下载 Flink 三件套 connector jar
+# fetch-flink-jars.sh — 下载 Flink connector 三件套 + MySQL JDBC 驱动
 # -----------------------------------------------------------------------------
 # 为什么要脚本而不是直接提交 jar：
-#   三个 jar 合计约 50MB。二进制进 git 会让仓库永久膨胀（git 无法真正删除历史
+#   这些 jar 合计约 55MB。二进制进 git 会让仓库永久膨胀（git 无法真正删除历史
 #   里的大文件），且无法 code review。用固定 URL + 版本号，任何人在任何机器上
 #   一条命令就能复现同样的环境。
 #
-# 这三个 jar 是**版本强耦合**的，改任何一个都要回到 docs/04 §1 重新核对：
+# 三个 connector 是**版本强耦合**的，改任何一个都要回到 docs/04 §1 重新核对：
 #   flink-sql-connector-mysql-cdc-3.2.1.jar   ← Flink CDC 3.2.1，支持 Flink 1.17~1.19
 #   flink-sql-connector-kafka-3.1.0-1.18.jar  ← 制品名带 Flink 次版本，必须 1.18
 #   flink-doris-connector-1.18-24.0.1.jar     ← 同上，1.18 专用包
 #
 # 最隐蔽的一环是第三个：升级 Flink 1.18 → 1.19 时忘了换它，集群能起、作业能提交，
 # 第一条数据写 Doris 才报 NoSuchMethodError。所以下载完会校验文件名里的 1.18。
+#
+# 第四个 jar 是**唯一不属于 Flink 生态的**，也是最容易漏的：
+#   mysql-connector-java-8.0.27.jar
+#   MySQL 官方 JDBC 驱动是 GPLv2 协议，与 Flink CDC 的 Apache-2.0 不兼容，所以
+#   flink-sql-connector-mysql-cdc 的 fat jar 里**刻意不打包**它。少了这个 jar，
+#   作业能编译、能提交、能生成 JobGraph，但在 TaskManager 真正连库那一刻炸：
+#       java.lang.ClassNotFoundException: com.mysql.cj.jdbc.Driver
+#   错在运行时而非提交时，报错也不提"缺驱动"，所以极难定位。版本选 8.0.27
+#   是 Flink CDC 官方文档明确写死的推荐值。
 #
 # 用法：
 #   bash scripts/fetch-flink-jars.sh          # 下载到 docker/flink/lib/
@@ -36,6 +45,7 @@ JARS=(
   "flink-sql-connector-mysql-cdc-3.2.1.jar|org/apache/flink/flink-sql-connector-mysql-cdc/3.2.1/flink-sql-connector-mysql-cdc-3.2.1.jar|21600000"
   "flink-sql-connector-kafka-3.1.0-1.18.jar|org/apache/flink/flink-sql-connector-kafka/3.1.0-1.18/flink-sql-connector-kafka-3.1.0-1.18.jar|5800000"
   "flink-doris-connector-1.18-24.0.1.jar|org/apache/doris/flink-doris-connector-1.18/24.0.1/flink-doris-connector-1.18-24.0.1.jar|42000000"
+  "mysql-connector-java-8.0.27.jar|mysql/mysql-connector-java/8.0.27/mysql-connector-java-8.0.27.jar|2500000"
 )
 
 fail=0
@@ -101,5 +111,5 @@ if [[ $fail -gt 0 ]]; then
   echo "  MAVEN_MIRROR=https://maven.aliyun.com/repository/public bash scripts/fetch-flink-jars.sh --force"
   exit 1
 fi
-echo "三个 jar 就绪，目录：$LIB"
+echo "四个 jar 就绪（3 connector + 1 JDBC 驱动），目录：$LIB"
 echo "下一步：docker compose -f docker/docker-compose.yml --profile compute up -d"
