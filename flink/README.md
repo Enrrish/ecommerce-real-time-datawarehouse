@@ -214,12 +214,44 @@ DWS 是第一次做**多层聚合**的层，实跑下来推翻了三处原设计
 - **支付金额 ≠ GMV**：`SUM(payment_value)` 16,008,872.12 vs `SUM(item_total)` 15,843,553.24。
   差额里混着 775 个无明细订单的支付（162,591.95）和 Olist 本身的「支付 ≠ 商品+运费」偏差（2,726.93）。
 
-## 下一步（P6）
+## P6 实测结论（写给 P7 的自己）
 
-ADS 6 张应用表 + 脏数据注入验证。要点：
+**ADS 没有新增任何 Flink 作业。** 6 张表全部由 Doris 侧 `INSERT OVERWRITE` 从 DWS/DWD
+派生（`sql/doris/08-ads-refresh.sql`）。不是偷懒：4 slots 已被常驻作业占满，且 ADS 服务的
+是「看板刷新」这个动作，不是每来一条数据就变一次 —— 批语义本来就对。这也是本层唯一
+一次「不起流作业」的选择，P7 如果要做秒级跳动的大屏，得回到这里重新决策。
 
-- **注入重复 `event_id` 时，漏斗 `pv` 必须不变。** 09 号作业已经加了 `ROW_NUMBER` 去重，
-  P6 要验证它真能扛住 3%。这是唯一一处「DWS 不依赖 DWD 去重」的地方，写错了没人拦。
-- **ADS 累计类可以用 AGGREGATE 模型**（`docs/02` §2 已改成只在这一层用），因为 ADS 由
-  DWS 一次性刷出，不承接 Flink 的连续更新流。
-- 验收口径固定在 `sql/doris/06-dws-verify.sql`，P6 之后每次改链路都先跑它。
+**脏数据注入的实测数字（可直接引用）：**
+
+| 观测项 | 结果 |
+| --- | --- |
+| 发送 3,091 条（3,001 唯一 + 90 重复） | ODS / DWD / DWS 三层都只 +3,001 |
+| `dws_traffic_funnel_1h` 去重 | `ROW_NUMBER` + `PROCTIME()` 生效，**这是唯一不依赖 DWD 去重的链路** |
+| 注入 2 条字段级脏数据（空 `user_id` / 非法 `event_type`） | DWD 标 `is_valid=0` 保留为证据，DWS 漏斗 pv 不变 |
+| 重放 370 行交易明细 | 112,650 行 / 15,843,553.24 完全不变 |
+
+**`is_valid` 标记 + 聚合时 `WHERE is_valid = 1` 这个组合被验证是有效的**：
+脏数据不丢（留证据、可追溯），也不污染指标。比「解析失败就丢弃」好 —— 后者
+出问题时你根本不知道丢了多少。
+
+**三条给 P7 的约束：**
+
+1. **大屏上任何跨时间桶相加的去重指标都是错的。** `dws_trade_overview_1m.buyer_cnt`
+   是分钟级去重，`dws_traffic_funnel_1h.uv` 是小时级去重。日活必须从 `dwd_trade_order_detail`
+   或 `dwd_user_event_clean` 重新 `COUNT(DISTINCT)`。ADS 里 `ads_realtime_overview`
+   的 `buyer_cnt` 已按此显式注释，别被字段名骗了。
+2. **`ads_funnel_1d` 是唯一不回 DWS 的 ADS 表**，直接读 DWD 明细重算 UV —— 因为
+   小时 UV 不可加（同一用户 10:30 浏览、11:10 加购会在两行各算一次）。22,004 行的
+   扫描换一个不会算错的 UV，这个交换没有犹豫余地。
+3. **验收要跑三份**：`06-dws-verify.sql`（DWS vs DWD）、`09-ads-verify.sql`
+   （ADS vs 上游 + 派生指标定义）、`collect-pipeline-health.sh`（链路健康度）。
+   只跑前两份只能证明数字对，证明不了「链路还活着」。
+
+## 下一步（P7）
+
+大屏接真数据。两个待定：
+
+- **ADS 没有地域表**，而大屏有地图组件。要么让大屏直接查 `dws_trade_region_1d`，
+  要么补第 7 张 ADS 表（当前 4 slots 已满，补表不影响 slot，因为 ADS 是 Doris 侧刷）。
+- **日粒度三张表不常驻**（`08-dws-trade-daily` 跑完即停）。大屏的品类排行、地域热力图
+  读的正是它们，若要跟着实时跳动，得腾 slot 让作业常驻，或者定时重提（幂等）。

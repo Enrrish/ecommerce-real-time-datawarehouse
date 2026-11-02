@@ -14,7 +14,10 @@ sql/
     ├── 03-dwd.sql             # DWD 明细层 + 维度表 7 张
     ├── 04-dwd-load.sql        # 5 张维表的一次性装载（在 Doris 侧跑，不经过 Flink）
     ├── 05-dws.sql             # DWS 汇总层 6 张表
-    └── 06-dws-verify.sql      # DWS 验收：6 张表 vs DWD 重算，diff 必须为 0
+    ├── 06-dws-verify.sql      # DWS 验收：6 张表 vs DWD 重算，diff 必须为 0
+    ├── 07-ads.sql             # ADS 应用层 6 张表
+    ├── 08-ads-refresh.sql     # ADS 刷新：INSERT OVERWRITE，幂等可重跑
+    └── 09-ads-verify.sql      # ADS 验收：6 张表 vs 上游重算，diff 必须为 0
 ```
 
 ## 层的边界：哪些建表、哪些装数
@@ -23,9 +26,9 @@ sql/
 
 | 类型 | 文件 | 做什么 |
 | --- | --- | --- |
-| 建表 DDL | `01-ods.sql`、`03-dwd.sql`、`05-dws.sql` | 只 `CREATE TABLE`，不含数据 |
-| 校验 | `02-verify.sql`、`06-dws-verify.sql` | 只 `SELECT`，不改数据 |
-| 装载 | `04-dwd-load.sql` | `INSERT ... SELECT`，把 ODS 加工成 5 张维表 |
+| 建表 DDL | `01-ods.sql`、`03-dwd.sql`、`05-dws.sql`、`07-ads.sql` | 只 `CREATE TABLE`，不含数据 |
+| 校验 | `02-verify.sql`、`06-dws-verify.sql`、`09-ads-verify.sql` | 只 `SELECT`，不改数据 |
+| 装载 | `04-dwd-load.sql`、`08-ads-refresh.sql` | `INSERT ... SELECT`，把上层加工成下层 |
 
 `dwd_trade_order_detail` 和 `dwd_user_event_clean` 不在这里建数据 —— 它们由 `flink/sql/05`、`06` 两条
 流式作业持续写入。**维表走批、事实走流**，这是 P4 定下的分层依据（见 `flink/README.md`「P4 实测结论」）。
@@ -33,6 +36,17 @@ sql/
 DWS 的 6 张表同理：`05-dws.sql` 只建表，数据由 `flink/sql/07`、`08`、`09` 三条流式作业写入。
 `06-dws-verify.sql` 是 P5 的验收单 —— 它把每张 DWS 表与「DWD 明细现算一遍」的结果逐项相减，
 **除口径本就不同的项以外，所有 diff 必须是 0**。改任何上游逻辑后先跑它。
+
+ADS 不一样：**它不起 Flink 作业，由 Doris 自己刷**（`08-ads-refresh.sql`）。
+两个原因：4 slots 已被常驻作业占满；且 ADS 服务的是「看板刷新」这个动作，
+不是每来一条数据就变一次，批语义更合适。刷新用 `INSERT OVERWRITE` 整表重建 ——
+`INSERT INTO` 在 UNIQUE 表上是「按主键覆盖」，新结果里消失的行会残留在表里，
+排出个已经不存在的前三名而 Doris 不会报错。
+
+`09-ads-verify.sql` 是 P6 的验收单，比 `06` 多验一类东西：**派生指标的定义**。
+不只是「ADS 与上游数字相等」，还要验占比合计是否等于 1、排名是否连续、
+累计列的当日末尾值是否等于当日总额。这三类错误不会让行数或 GMV 对不上，
+只会在展示层悄悄错。
 
 ## 命名规范
 
@@ -62,4 +76,4 @@ DWS 的 6 张表同理：`05-dws.sql` 只建表，数据由 `flink/sql/07`、`08
 - [x] `doris/01-ods.sql`、`02-verify.sql`
 - [x] `doris/03-dwd.sql`、`04-dwd-load.sql`
 - [x] `doris/05-dws.sql`、`06-dws-verify.sql`
-- [ ] `doris/07-ads.sql`、`08-ads-verify.sql`（P6）
+- [x] `doris/07-ads.sql`、`08-ads-refresh.sql`、`09-ads-verify.sql`

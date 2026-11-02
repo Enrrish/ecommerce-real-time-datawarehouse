@@ -9,7 +9,8 @@ scripts/
 ├── import.sh             # 一键：起 MySQL → 预处理 → 导入 → 验收
 ├── gen_user_events.py    # 合成埋点事件 → Kafka
 ├── fetch-flink-jars.sh   # 下载 4 个 connector jar（含 MySQL JDBC 驱动）
-└── submit-sql.sh         # 提交 Flink SQL 作业并打印运行状态
+├── submit-sql.sh         # 提交 Flink SQL 作业并打印运行状态
+└── collect-pipeline-health.sh  # 采集链路健康度 → ads_pipeline_health（P6）
 ```
 
 ## 依赖
@@ -74,7 +75,17 @@ python scripts/gen_user_events.py --events 5 --sink stdout
 
 # 幂等验证：混入 3% 重复事件（event_id 相同）
 python scripts/gen_user_events.py --events 20000 --dup-rate 0.03
+
+# 质量验证：3% 重复 + 5% 乱序到达（迟到 ≥ 5 分钟）
+python scripts/gen_user_events.py --events 3000 --dup-rate 0.03 --late-rate 0.05
 ```
+
+**`--late-rate` 只改发送顺序，不改 `event_time` —— 这一点是必须的。**
+把 `event_time` 改早但投递顺序不变，在 event-time 语义下仍然算准时到达，
+下游（无窗口聚合）测不出任何区别，验证不到东西。真正的乱序必须让事件
+「晚到」：先把它从有序队列里抽出来、挪到队尾再发。
+抽取条件是 `event_time <= 队尾 - late_min_sec`，保证迟到量**至少** N 秒，
+而不是「平均 N 秒」——否则抽出来的事件可能只早 3 秒，落在任何合理水位线内。
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
@@ -82,7 +93,9 @@ python scripts/gen_user_events.py --events 20000 --dup-rate 0.03
 | `--rate` | 0 | 每秒条数，0 = 不限速 |
 | `--duration` | 0 | 持续秒数，配合 `--rate` |
 | `--window` | 3600 | `event_time` 铺开的时间窗口（秒） |
-| `--dup-rate` | 0 | 重复事件比例 |
+| `--dup-rate` | 0 | 重复事件比例（同 `event_id` 发两次） |
+| `--late-rate` | 0 | 乱序到达比例（只改发送顺序，不改 `event_time`） |
+| `--late-min-sec` | 300 | 乱序事件的迟到量下限（秒） |
 | `--p-add` / `--p-checkout` / `--p-pay` | 0.18 / 0.35 / 0.50 | 漏斗各环节转化率 |
 | `--bootstrap` | `localhost:29092` | 宿主机侧地址（容器内用 `kafka:9092`） |
 | `--seed` | 无 | 随机种子，便于复现 |
@@ -164,10 +177,38 @@ bash scripts/submit-sql.sh flink/sql/01-ods-orders.sql
 
 ---
 
-## 待补充（P6）
+## `collect-pipeline-health.sh`
 
-- [ ] `inject_dirty_data.py`：乱序、超时迟到、字段缺失注入
-      （重复事件已由 `gen_user_events.py --dup-rate` 覆盖）
-- [ ] 迟到数据必须**延迟投递**才有意义——只把 `event_time` 改早、投递顺序不变，
-      在 event-time 语义下仍然算准时到达，起不到验证 watermark 的作用
-- [ ] `check_lag.py`：端到端延迟采样
+采集 10 个链路指标写入 `ads_pipeline_health`，供大屏健康度面板读取。
+
+```bash
+bash scripts/collect-pipeline-health.sh              # 全量采集（约 30-40s）
+bash scripts/collect-pipeline-health.sh --skip-kafka # 跳过 Kafka 抽样（约 5s）
+```
+
+为什么是脚本而不是一条 SQL：指标分布在三个系统 —— Doris（事件年龄 / 管道新鲜度 /
+无效交易）、Flink（checkpoint / 作业数）、Kafka（积压 / 重复率 / 乱序率）。
+没有任何一个系统能单独算全。**监控必须旁路采集**，不能挂在被观测的主链路上：
+主链路挂了、指标也停了，那就永远发现不了挂。
+
+**质量指标的口径是这张表最容易做错的地方。** `dup_rate` / `late_ratio` 用
+「最近 N 条滑动窗口 + 跨分区均分」，实测试了三次才对：
+
+| 口径 | 测出值（真实注入 3%） | 为什么错 |
+| --- | --- | --- |
+| 全 topic 累计 | 0.19% | 60 条重复被 2 万条历史稀释 15 倍 |
+| 单分区最近 3,000 条 | 1.27% | 窗口大于注入批次，混进 2,000 条旧数据 |
+| **3 分区各取 1,000 条** | **2.97%** | ✅ |
+
+累计口径会让质量指标越跑越「健康」，最后彻底失效 —— 这跟「平均值掩盖长尾」
+是同一类错误，但更隐蔽：指标本身在动，只是永远不动到告警线。
+
+---
+
+## 待补充（P7）
+
+- [x] 乱序注入 —— 已内联到 `gen_user_events.py --late-rate`，没有单独建脚本
+      （重复事件由 `--dup-rate` 覆盖，两者共用同一批生成逻辑更省事）
+- [x] 健康度采集 —— `collect-pipeline-health.sh`
+- [ ] `check_lag.py`：端到端延迟 P99 采样（当前用 P3 的 3,849ms 单次实测作常量，
+      需要采 200 次以上才够报 P99，见 `docs/03 §5`）

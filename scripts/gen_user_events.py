@@ -37,6 +37,9 @@ gen_user_events.py —— 合成用户行为埋点日志，写 Kafka
   # P6 幂等验证：混入 3% 的重复事件（event_id 相同）
   python scripts/gen_user_events.py --events 20000 --dup-rate 0.03
 
+  # P6 质量验证：3% 重复 + 5% 乱序到达（迟到 ≥ 5 分钟，只改发送顺序不改时间）
+  python scripts/gen_user_events.py --events 3000 --dup-rate 0.03 --late-rate 0.05
+
 依赖：生成部分只用标准库；--sink kafka 需要 kafka-python-ng
       （python -m pip install kafka-python-ng）
 """
@@ -234,6 +237,32 @@ def generate(args) -> list[dict]:
         all_events.extend(rng.sample(all_events, min(n_dup, len(all_events))))
 
     all_events.sort(key=lambda e: e["event_time"])
+
+    # 注入乱序到达（P6 质量验证）
+    # -------------------------------------------------------------------------
+    # 关键点：**只改发送顺序，不改 event_time**。
+    # 把一批 event_time 靠前的事件从原位置抽出来、挪到队尾发送，它们到达时
+    # 已经落在「已处理的最大事件时间」之后，构成真正的乱序到达。
+    #
+    # 如果反过来只把 event_time 往前拨、发送顺序仍保持有序，那只是「数据更旧」，
+    # 不构成乱序，下游（无窗口聚合）完全测不出区别，验证不到任何东西。
+    #
+    # 抽取条件是 event_time <= 队尾 - late_min_sec，保证迟到量**至少** N 秒，
+    # 而不是「平均 N 秒」。否则抽样出来的事件可能只早 3 秒，落在水位线内。
+    if args.late_rate > 0:
+        # event_time 在事件字典里是 'yyyy-MM-dd HH:mm:ss.SSS' 字符串（不是 datetime），
+        # 但这个格式的字典序与时间序一致，所以直接比字符串即可，不必解析再格式化。
+        last_ts = datetime.strptime(all_events[-1]["event_time"], "%Y-%m-%d %H:%M:%S.%f")
+        cutoff = (last_ts - timedelta(seconds=args.late_min_sec)).strftime(
+            "%Y-%m-%d %H:%M:%S.%f")[:-3]
+        cand = [i for i, e in enumerate(all_events) if e["event_time"] <= cutoff]
+        n_late = min(int(len(all_events) * args.late_rate), len(cand))
+        if n_late > 0:
+            idx = set(rng.sample(cand, n_late))
+            late_evts = [all_events[i] for i in sorted(idx)]
+            rest = [e for i, e in enumerate(all_events) if i not in idx]
+            all_events = rest + late_evts
+
     return all_events
 
 
@@ -320,6 +349,10 @@ def main() -> int:
     ap.add_argument("--duration", type=int, default=0, help="持续秒数；>0 时按 rate*duration 计算事件数")
     ap.add_argument("--window", type=int, default=3600, help="event_time 铺开的时间窗口（秒）")
     ap.add_argument("--dup-rate", type=float, default=0.0, help="重复事件比例，用于幂等验证")
+    ap.add_argument("--late-rate", type=float, default=0.0,
+                    help="乱序到达比例：这些事件会在排序后被挪到队尾发送（event_time 不变）")
+    ap.add_argument("--late-min-sec", type=int, default=300,
+                    help="乱序事件的迟到量下限（秒），默认 300 = 至少迟到 5 分钟")
     ap.add_argument("--p-add", type=float, default=0.18, help="商品级加购率")
     ap.add_argument("--p-checkout", type=float, default=0.35, help="加购到提交的转化率")
     ap.add_argument("--p-pay", type=float, default=0.50, help="提交到支付的转化率")
@@ -351,6 +384,10 @@ def main() -> int:
               f"{steps['pay'] / steps['page_view'] * 100:.2f}%")
     if args.dup_rate:
         print(f"  含重复事件 {int(total * args.dup_rate / (1 + args.dup_rate))} 条（dup-rate={args.dup_rate}）")
+    if args.late_rate:
+        n_late = int(total * args.late_rate)
+        print(f"  乱序到达 {n_late} 条（late-rate={args.late_rate}，"
+              f"迟到 ≥ {args.late_min_sec}s，已挪到队尾发送）")
 
     if args.sink == "kafka":
         sink_kafka(events, args)
