@@ -9,11 +9,15 @@
 | `mysql` | `source` | 768 MB | 3306 | 业务库，开启 binlog（`ROW` + `FULL`） |
 | `kafka` | `source` | 768 MB | **29092**（宿主）/ 9092（容器内） | KRaft 单节点，免 ZooKeeper |
 | `flink-jobmanager` | `compute` | 768 MB | 8081 | Web UI |
-| `flink-taskmanager` | `compute` | 2.5 GB | — | 10 slots（9 CDC + 1 埋点），RocksDB |
+| `flink-taskmanager` | `compute` | 2.5 GB | — | **4 slots**，taskHeap 868MB / managed 512MB |
 | `doris-fe` | `olap` | 1.5 GB | 8030 / 9030 | Web UI / MySQL 协议端口 |
 | `doris-be` | `olap` | 2.5 GB | 8040 | 单 BE，`replication_num=1` |
 
 合计约 **8.75 GB**，WSL 上限 10GB（`docs/04` §4），余量约 1.2GB 留给内核与 dockerd。
+
+> **slot 数不是"能跑几个作业"的开关，是内存切分粒度。** TM 的 taskHeap 按 slot 数均分：
+> 10 个 slot 时每个只有 86.8MB（P3 跑 10 个单流作业正合适），4 个时每个 217MB（P4 跑
+> 6 表 join 需要）。改这个数字比改内存总量更对症，且不用重启 Doris / MySQL。
 
 `kafka-ui`（256 MB / 8080）暂不启用：用 `kafka-console-consumer.sh` 查积压即可，省一个容器。
 
@@ -77,9 +81,12 @@ Olist CSV ──load──▶ │                                 │──▶ F
 - [x] `docker-compose.yml`（六服务，三 profile，固定 IP 网段 172.28.0.0/24）
 - [x] `.env.example`
 - [x] WSL2 `.wslconfig` 内存上限（`memory=10GB`，见 `docs/04-环境搭建.md` §4）
-- [x] `flink-jobmanager` / `flink-taskmanager`（1 TM / 10 slots，四个 jar 挂载）
+- [x] `flink-jobmanager` / `flink-taskmanager`（1 TM / **4 slots**，四个 jar 挂载）
 - [x] `doris-fe` / `doris-be`（BE 30 秒内注册 Alive）
-- [x] 六容器全部 healthy，10 个 Flink 作业同时 RUNNING
+- [x] 六容器全部 healthy
+- [x] P3 阶段 10 个作业同时 RUNNING（9 CDC + 1 埋点，占满当时的 10 slots）
+- [x] P4 阶段改为 2 个作业常驻（`dwd_trade_order_detail` + `dwd_user_event_clean`），
+      腾出的 slot 换成每 slot 217MB 内存 —— 详见 `flink/README.md`「关键配置」
 
 **内存是这个文件里最不能动的参数**。改任何 `mem_limit` 都要回到 `docs/04 §4` 重算合计，
 六项之和必须压在 8.75GB 以内——超过 10GB 会触发 WSL 的 OOM Killer，而被杀的往往不是

@@ -160,7 +160,7 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         jobmanager.rpc.port: 6123
         jobmanager.memory.process.size: 768m
-        taskmanager.numberOfTaskSlots: 10
+        taskmanager.numberOfTaskSlots: 4
         parallelism.default: 1
         # checkpoint 间隔就是数据对 Doris 的可见延迟上限：
         # Doris Connector 靠 checkpoint 触发 Stream Load 提交，不设的话
@@ -205,7 +205,7 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         jobmanager.rpc.port: 6123
-        taskmanager.numberOfTaskSlots: 10
+        taskmanager.numberOfTaskSlots: 4
         parallelism.default: 1
         execution.checkpointing.interval: 10s
         execution.checkpointing.mode: EXACTLY_ONCE
@@ -214,10 +214,18 @@ services:
         state.backend.incremental: true
         # TM 的堆外与托管内存必须显式给，否则 Flink 按容器总内存推算，
         # 在 cgroup 限制下容易算出负数直接启动失败。
-        taskmanager.memory.process.size: 1536m
-        taskmanager.memory.managed.size: 256m
+        # process.size 必须比 mem_limit 小约 10%：差额是 JVM 之外的线程栈、
+        # page cache 与容器自身开销，留不够会被 cgroup OOM Kill（不是 Java OOM）。
+        #
+        # 2304m 实测：taskHeap 868MB、managed 512MB、network 181.8MB。
+        # 这 868MB 是按 numberOfTaskSlots **均分**的 —— 10 个 slot 时每个只有
+        # 86.8MB，跑 DWD 的 6 表 join 不够；改成 4 个 slot 后每 slot 217MB。
+        # slot 数不是"越多越好"，它就是内存切分粒度：作业少的时候降 slot 数，
+        # 把内存集中给重作业；ODS 那种单流同步作业多的时候再调回 10。
+        taskmanager.memory.process.size: 2304m
+        taskmanager.memory.managed.size: 512m
         taskmanager.memory.network.min: 64m
-        taskmanager.memory.network.max: 128m
+        taskmanager.memory.network.max: 256m
     volumes:
       - ../flink/checkpoints:/opt/flink/checkpoints
       - ./flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:ro
