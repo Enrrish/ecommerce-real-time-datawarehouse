@@ -12,7 +12,9 @@ sql/
     ├── 01-ods.sql             # ODS 贴源层 10 张表
     ├── 02-verify.sql          # ODS 层七类核对
     ├── 03-dwd.sql             # DWD 明细层 + 维度表 7 张
-    └── 04-dwd-load.sql        # 5 张维表的一次性装载（在 Doris 侧跑，不经过 Flink）
+    ├── 04-dwd-load.sql        # 5 张维表的一次性装载（在 Doris 侧跑，不经过 Flink）
+    ├── 05-dws.sql             # DWS 汇总层 6 张表
+    └── 06-dws-verify.sql      # DWS 验收：6 张表 vs DWD 重算，diff 必须为 0
 ```
 
 ## 层的边界：哪些建表、哪些装数
@@ -21,12 +23,16 @@ sql/
 
 | 类型 | 文件 | 做什么 |
 | --- | --- | --- |
-| 建表 DDL | `01-ods.sql`、`03-dwd.sql` | 只 `CREATE TABLE`，不含数据 |
-| 校验 | `02-verify.sql` | 只 `SELECT`，不改数据 |
+| 建表 DDL | `01-ods.sql`、`03-dwd.sql`、`05-dws.sql` | 只 `CREATE TABLE`，不含数据 |
+| 校验 | `02-verify.sql`、`06-dws-verify.sql` | 只 `SELECT`，不改数据 |
 | 装载 | `04-dwd-load.sql` | `INSERT ... SELECT`，把 ODS 加工成 5 张维表 |
 
 `dwd_trade_order_detail` 和 `dwd_user_event_clean` 不在这里建数据 —— 它们由 `flink/sql/05`、`06` 两条
 流式作业持续写入。**维表走批、事实走流**，这是 P4 定下的分层依据（见 `flink/README.md`「P4 实测结论」）。
+
+DWS 的 6 张表同理：`05-dws.sql` 只建表，数据由 `flink/sql/07`、`08`、`09` 三条流式作业写入。
+`06-dws-verify.sql` 是 P5 的验收单 —— 它把每张 DWS 表与「DWD 明细现算一遍」的结果逐项相减，
+**除口径本就不同的项以外，所有 diff 必须是 0**。改任何上游逻辑后先跑它。
 
 ## 命名规范
 
@@ -55,5 +61,5 @@ sql/
 - [x] `mysql/01-schema.sql`、`03-load.sql`
 - [x] `doris/01-ods.sql`、`02-verify.sql`
 - [x] `doris/03-dwd.sql`、`04-dwd-load.sql`
-- [ ] `doris/05-dws.sql`（P5）
-- [ ] `doris/06-ads.sql`（P6）
+- [x] `doris/05-dws.sql`、`06-dws-verify.sql`
+- [ ] `doris/07-ads.sql`、`08-ads-verify.sql`（P6）

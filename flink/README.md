@@ -11,7 +11,10 @@ flink/
 │   ├── 03-ods-facts.sql         # 3 张明细表：order_items / order_payments / order_reviews
 │   ├── 04-ods-user-event.sql    # Kafka topic user_event → ods_user_event
 │   ├── 05-dwd-trade-order-detail.sql  # 6 表 CDC 直连 join → 交易宽表（P4 核心）
-│   └── 06-dwd-user-event-clean.sql    # Kafka 埋点清洗 → dwd_user_event_clean
+│   ├── 06-dwd-user-event-clean.sql    # Kafka 埋点清洗 → dwd_user_event_clean
+│   ├── 07-dws-trade-overview-1m.sql   # 分钟级交易概览（P5 实时主表）
+│   ├── 08-dws-trade-daily.sql         # 类目 / 卖家 / 地域 三张日粒度汇总
+│   └── 09-dws-event-payment.sql       # 小时漏斗（Kafka 去重）+ 支付方式日汇总
 ├── checkpoints/                 # Checkpoint 落盘目录（按 job id 分子目录，已 gitignore）
 ├── lib/                         # 四个 connector jar（gitignore，见 scripts/fetch-flink-jars.sh）
 └── jobs/                        # 空。早期规划的目录名，已由 sql/ 取代，保留占位
@@ -49,7 +52,7 @@ bash scripts/submit-sql.sh flink/sql/02-ods-dimensions.sql
 | 表名 | 与 Doris 侧完全一致，便于排查 |
 | 并行度 | **全部 1**。slot 数是内存切分粒度，见下面「关键配置」 |
 | `server-id` | 每表一段，互不重叠（见下表） |
-| Watermark | ODS / DWD 层不设。CDC 是 changelog 流，没有乱序问题；watermark 从 DWS 窗口聚合才开始用 |
+| Watermark | **全层都不设**。CDC 是 changelog 流没有乱序问题；DWS 也改成了无窗口 GROUP BY，不需要时间属性。唯一需要排序的地方（埋点去重）用 `PROCTIME()` |
 
 `server-id` 分配（MySQL CDC 靠它伪装成 slave，**两个作业撞号会互相踢下线**，
 现象是「两个作业交替重启」，而不是报错）：
@@ -72,6 +75,18 @@ bash scripts/submit-sql.sh flink/sql/02-ods-dimensions.sql
 | `05-dwd` 的 `products` | 5547–5550 | 4 |
 | `05-dwd` 的 `sellers` | 5551–5554 | 4 |
 | `05-dwd` 的 `category_translation` | 5555–5558 | 4 |
+| `07-dws-overview` 的 `orders` | 5561–5564 | 4 |
+| `07-dws-overview` 的 `order_items` | 5565–5568 | 4 |
+| `07-dws-overview` 的 `customers` | 5569–5572 | 4 |
+| `07-dws-overview` 的 `order_payments` | 5573–5576 | 4 |
+| `08-dws-daily` 的 `orders` | 5581–5584 | 4 |
+| `08-dws-daily` 的 `order_items` | 5585–5588 | 4 |
+| `08-dws-daily` 的 `customers` | 5589–5592 | 4 |
+| `08-dws-daily` 的 `products` | 5593–5596 | 4 |
+| `08-dws-daily` 的 `sellers` | 5597–5600 | 4 |
+| `08-dws-daily` 的 `category_translation` | 5601–5604 | 4 |
+| `09-dws-event-payment` 的 `order_payments` | 5605–5608 | 4 |
+| `09-dws-event-payment` 的 `orders` | 5609–5612 | 4 |
 
 DWD 作业读的是**和 ODS 完全相同的 7 张表**，但必须另开一段 server-id 段——
 它和 ODS 是两套独立的 binlog 消费者，撞号会让两个作业互相踢下线。
@@ -151,6 +166,10 @@ state.backend.incremental: true
 | **所有算子都在出数，但某个算子 ack 不动** | 若线程栈停在 `RocksDB.put` 的 native 调用且 CPU 时间极低，是磁盘 I/O 等待不是死锁 | `SET 'state.backend' = 'hashmap'` |
 | `OVER windows' ordering in stream mode must be defined on a time attribute` | 流模式 OVER 聚合强制 ORDER BY 落在时间属性上 | 在 source 里用计算列 + `WATERMARK FOR` 提升成时间属性。但要想清楚尾部滞回（见下一条） |
 | **加了 watermark 后表里少了几十行，缺的总是最新的那几条** | 水位线永远落后于最新数据，`max - delay` 之后的行会卡在 OVER 算子里出不来；没有新数据推动就永远不出 | 别为了排序而加 watermark。排序交给下游 `ORDER BY event_time`，event_time 本身不可变、毫秒精度够用 |
+| **作业 RUNNING 但状态是 `RESTARTING`，异常栈报 `NoResourceAvailableException`，且集群 `slots-total` 归 0** | 不是调度问题，是 TM 被 OOM 打死了。JM 招不到资源只是后果 | 先看 `docker logs rt-flink-tm \| grep OutOfMemory`。根因通常是状态超了 slot 的 taskHeap —— 一个作业塞多张表会让 join 子计划各展开一份、状态成倍 |
+| **多个 `INSERT` 放进一个 `EXECUTE STATEMENT SET`，以为是共享 join，实际是 4 份** | `SubplanReuseExecutor` 按 RelNode 全等去重，各 INSERT 的 SELECT 列表不同 → 投影裁剪给出不同的输出行类型 → 认不出是同一棵树 | 提交后看 `/jobs/{id}` 的 `vertices` 数量：Join 算子个数 ÷ 维表数 如果等于 INSERT 数，就是没复用。拆作业，并让每张表只 join 自己真正需要的维表 |
+| **DWS 直连 Kafka 算出来的 `pv` 比 DWD 多** | DWD 靠 UNIQUE 主键天然去重，DWS 没有这层保护 | 加 `ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY PROCTIME())` 去重视图；用 `PROCTIME()` 而不是 `WATERMARK` 排序，避免尾部滞回 |
+| `Incompatible types for sink column 'hour' at position 1` | `HOUR()` 在 Flink 里返回 **BIGINT**，不是 MySQL 的 INT | 显式 `CAST(HOUR(ts) AS INT)` |
 
 完整版（含环境层）在 `docs/04 §6`。
 
@@ -170,12 +189,37 @@ DWD 是第一次遇到 **join** 的层，和 ODS 的单流同步是两类问题�
    24.0.1 上认证链路走不通。维表是一次性加载的静态历史，用 Doris 批处理
    （`sql/doris/04-dwd-load.sql`）更短更好验证。
 
-## 下一步（P5）
+## P5 实测结论（写给 P6 的自己）
 
-DWS 6 张预聚合表。三个要点：
+DWS 是第一次做**多层聚合**的层，实跑下来推翻了三处原设计：
 
-- 窗口聚合会第一次真正用上 watermark，`docs/05` P5 段写的「延迟 30s + allowed lateness 5 分钟」
-  要在实测里校准 —— 别照抄参数，先量出数据的实际乱序分布。
-- 支付方式占比从 `ods_order_payments` 算，不在 DWD 宽表里 —— 支付方式是订单级的一对多属性，
-  硬塞进订单行粒度的宽表只能是近似（见 `sql/doris/03-dwd.sql` 里 `dwd_trade_order_detail` 的注释）。
-- DWS 的 GMV 要和 P4 宽表的口径对齐：`SUM(item_total)` = 15,843,553.24 是基准线。
+1. **原方案「TUMBLE 窗口 + Watermark 30s + allowed lateness 5min」不成立，已换成无窗口
+   `GROUP BY`。** 理由是可验证的：埋点事件分两批、中间空 3 天，lateness 5 分钟接不住；
+   交易数据跨 616 天但 6 秒就快照完，水位线会瞬间跳过全部历史。无窗口后迟到多久都能
+   并进对应分桶，且每 key 每次下发全量新值，重放收敛。
+   顺带把「延迟 30s 要在实测里校准」这件事解决了 —— 干净数据上根本没有乱序可校准
+   （`scripts/gen_user_events.py` 第 236 行 `all_events.sort()` 全局排好序），
+   照抄那个数字只是编一个数。
+2. **表模型从 AGGREGATE 改成 UNIQUE KEY。** AGGREGATE 的 `SUM` 列默认「同 key 只导入一次」，
+   重放一次就翻倍。Doris sink 声明 `ChangelogMode.upsert()`，Flink 会自动插
+   `SinkUpsertMaterializer` 把 retract 流归一化成全量更新，幂等落在值上。
+3. **一个作业只能装一张（重）表。** 4 张表放一个 `STATEMENT SET` 时 join 子计划没复用，
+   状态从 105MB 乘成 420MB，直接把 TM 打 OOM。判断复用是否成立看 `vertices` 里的
+   Join 个数。08 号作业能装 3 张，是因为每张只 join 自己需要的维表，单链 40-55MB。
+
+另外两条口径事实，P6 做 ADS 时必须遵守：
+
+- **`order_cnt` 跨维度不可加**：`overview`/`region` 98,666、`category` 99,470、
+  `seller` 100,010、`payment` 101,686。总订单数只能查 DWD。
+- **支付金额 ≠ GMV**：`SUM(payment_value)` 16,008,872.12 vs `SUM(item_total)` 15,843,553.24。
+  差额里混着 775 个无明细订单的支付（162,591.95）和 Olist 本身的「支付 ≠ 商品+运费」偏差（2,726.93）。
+
+## 下一步（P6）
+
+ADS 6 张应用表 + 脏数据注入验证。要点：
+
+- **注入重复 `event_id` 时，漏斗 `pv` 必须不变。** 09 号作业已经加了 `ROW_NUMBER` 去重，
+  P6 要验证它真能扛住 3%。这是唯一一处「DWS 不依赖 DWD 去重」的地方，写错了没人拦。
+- **ADS 累计类可以用 AGGREGATE 模型**（`docs/02` §2 已改成只在这一层用），因为 ADS 由
+  DWS 一次性刷出，不承接 Flink 的连续更新流。
+- 验收口径固定在 `sql/doris/06-dws-verify.sql`，P6 之后每次改链路都先跑它。
