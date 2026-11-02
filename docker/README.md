@@ -9,11 +9,11 @@
 | `mysql` | `source` | 768 MB | 3306 | 业务库，开启 binlog（`ROW` + `FULL`） |
 | `kafka` | `source` | 768 MB | **29092**（宿主）/ 9092（容器内） | KRaft 单节点，免 ZooKeeper |
 | `flink-jobmanager` | `compute` | 768 MB | 8081 | Web UI |
-| `flink-taskmanager` | `compute` | 2 GB | — | 2 slots，RocksDB 状态后端 |
+| `flink-taskmanager` | `compute` | 2.5 GB | — | 10 slots（9 CDC + 1 埋点），RocksDB |
 | `doris-fe` | `olap` | 1.5 GB | 8030 / 9030 | Web UI / MySQL 协议端口 |
-| `doris-be` | `olap` | 3 GB | 8040 | 单 BE，`replication_num=1` |
+| `doris-be` | `olap` | 2.5 GB | 8040 | 单 BE，`replication_num=1` |
 
-合计约 **8.8 GB**，WSL 上限 10GB（`docs/04` §4），余量约 1.2GB 留给内核与 dockerd。
+合计约 **8.75 GB**，WSL 上限 10GB（`docs/04` §4），余量约 1GB 留给内核与 dockerd。
 
 `kafka-ui`（256 MB / 8080）暂不启用：用 `kafka-console-consumer.sh` 查积压即可，省一个容器。
 

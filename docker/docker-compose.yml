@@ -73,6 +73,9 @@ services:
       retries: 24
       start_period: 30s
     mem_limit: ${MYSQL_MEM_LIMIT:-768m}
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.12
 
   # ---------------------------------------------------------------------------
   # Kafka 3.7.1 —— KRaft 单节点（不装 ZooKeeper，省一个容器和 1GB 内存）
@@ -126,3 +129,179 @@ services:
       retries: 12
       start_period: 30s
     mem_limit: ${KAFKA_MEM_LIMIT:-768m}
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.13
+
+  # ---------------------------------------------------------------------------
+  # Flink 1.18.1 —— session 集群（JM + TM 分离）
+  # ---------------------------------------------------------------------------
+  # 三个 connector jar 必须**逐个文件**挂载到 /opt/flink/lib/，不能挂整个目录：
+  #   挂目录会用宿主机的空目录覆盖镜像自带的 /opt/flink/lib（里面是 flink-dist、
+  #   log4j 等核心包），结果是集群起来就报 ClassNotFoundException，且日志指向
+  #   一个"找不到 org.apache.flink.runtime.taskexecutor.TaskManagerRunner"这种
+  #   让人怀疑镜像坏了的错误。
+  #
+  # 镜像 tag 的 java11 后缀不是可选项：Flink 1.18 的 Scala 2.12 包在 Java 17 下
+  # 会抛 ReflectiveOperationException（FLINK-34658），见 docs/04 §2。
+  flink-jobmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: rt-flink-jm
+    profiles: ["compute"]
+    restart: unless-stopped
+    command: jobmanager
+    ports:
+      - "${FLINK_WEB_PORT:-8081}:8081"
+    environment:
+      TZ: Asia/Shanghai
+      # 整段配置用 FLINK_PROPERTIES 传，镜像的 entrypoint 会写进 flink-conf.yaml。
+      # 注意 YAML 的 | 块里不能有制表符，缩进必须用空格。
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.rpc.port: 6123
+        jobmanager.memory.process.size: 768m
+        taskmanager.numberOfTaskSlots: 10
+        parallelism.default: 1
+        # checkpoint 间隔就是数据对 Doris 的可见延迟上限：
+        # Doris Connector 靠 checkpoint 触发 Stream Load 提交，不设的话
+        # 数据会一直攒在内存里，表现为「作业 RUNNING 但 Doris 查不到数据」。
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.backend: rocksdb
+        state.backend.incremental: true
+        rest.flamegraph.enabled: true
+        # 关掉 web 上传 jar：作业全部走 SQL Client 提交，少一个攻击面
+        web.upload.enabled: false
+    volumes:
+      - ../flink/checkpoints:/opt/flink/checkpoints
+      - ../flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:ro
+      - ../flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
+      - ../flink/lib/flink-doris-connector-1.18-24.0.1.jar:/opt/flink/lib/flink-doris-connector-1.18-24.0.1.jar:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/overview >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: ${FLINK_JM_MEM_LIMIT:-768m}
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.20
+
+  flink-taskmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: rt-flink-tm
+    profiles: ["compute"]
+    restart: unless-stopped
+    command: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      TZ: Asia/Shanghai
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.rpc.port: 6123
+        taskmanager.numberOfTaskSlots: 10
+        parallelism.default: 1
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.backend: rocksdb
+        state.backend.incremental: true
+        # TM 的堆外与托管内存必须显式给，否则 Flink 按容器总内存推算，
+        # 在 cgroup 限制下容易算出负数直接启动失败。
+        taskmanager.memory.process.size: 1536m
+        taskmanager.memory.managed.size: 256m
+        taskmanager.memory.network.min: 64m
+        taskmanager.memory.network.max: 128m
+    volumes:
+      - ../flink/checkpoints:/opt/flink/checkpoints
+      - ../flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-3.2.1.jar:ro
+      - ../flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
+      - ../flink/lib/flink-doris-connector-1.18-24.0.1.jar:/opt/flink/lib/flink-doris-connector-1.18-24.0.1.jar:ro
+    mem_limit: ${FLINK_TM_MEM_LIMIT:-2560m}
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.21
+
+  # ---------------------------------------------------------------------------
+  # Apache Doris 2.1.11 —— FE + BE
+  # ---------------------------------------------------------------------------
+  # 为什么要固定 IP 而不是用服务名：
+  #   FE 启动时把 FE_SERVERS 里的地址写进元数据，BE 启动时把 BE_ADDR 注册给 FE。
+  #   这两个地址会在**后续所有心跳与查询计划**中被复用。用 127.0.0.1 会指向
+  #   容器自己（BE 永远 Alive: false）；用服务名则依赖 Docker 内置 DNS，
+  #   在 FE 以 root 身份改写的配置文件里解析时机不确定。固定 IP 最稳。
+  #   代价是子网不能和宿主机已有网段冲突 —— 172.28.0.0/24 是刻意选的，
+  #   Windows 上常见的是 172.17~172.20（Docker 默认池）和 192.168.x。
+  doris-fe:
+    image: apache/doris:fe-2.1.11
+    container_name: rt-doris-fe
+    profiles: ["olap"]
+    restart: unless-stopped
+    environment:
+      # 格式：<名字>:<IP>:<edit_log_port>，9010 是 FE 的元数据同步端口
+      FE_SERVERS: fe1:172.28.0.10:9010
+      FE_ID: "1"
+      TZ: Asia/Shanghai
+    ports:
+      - "${DORIS_FE_HTTP_PORT:-8030}:8030"
+      - "${DORIS_FE_QUERY_PORT:-9030}:9030"
+    volumes:
+      - ./volumes/doris-fe/doris-meta:/opt/apache-doris/fe/doris-meta
+      - ./volumes/doris-fe/log:/opt/apache-doris/fe/log
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8030/api/bootstrap >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    mem_limit: ${DORIS_FE_MEM_LIMIT:-1536m}
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.10
+
+  doris-be:
+    image: apache/doris:be-2.1.11
+    container_name: rt-doris-be
+    profiles: ["olap"]
+    restart: unless-stopped
+    depends_on:
+      - doris-fe
+    environment:
+      FE_SERVERS: fe1:172.28.0.10:9010
+      # 格式：<IP>:<heartbeat_port>，9050 是 BE 向 FE 汇报的端口
+      BE_ADDR: 172.28.0.11:9050
+      TZ: Asia/Shanghai
+    ports:
+      - "${DORIS_BE_HTTP_PORT:-8040}:8040"
+    volumes:
+      - ./volumes/doris-be/doris-storage:/opt/apache-doris/be/storage
+      - ./volumes/doris-be/log:/opt/apache-doris/be/log
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8040/api/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    mem_limit: ${DORIS_BE_MEM_LIMIT:-2560m}
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.11
+
+# =============================================================================
+# 网络
+# -----------------------------------------------------------------------------
+# 显式声明子网 + 每容器固定 IP。所有服务都接进来（包括 mysql / kafka），
+# 否则 Flink 里的 'mysql:3306' / 'kafka:9092' 解析不到 —— 不同 network 之间
+# 没有 DNS。
+# =============================================================================
+networks:
+  rt-net:
+    name: rt-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
