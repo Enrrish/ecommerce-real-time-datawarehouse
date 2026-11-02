@@ -38,7 +38,7 @@ flowchart LR
         FLINK["Flink SQL<br/>去重 / 清洗 / 维表 Join / 窗口聚合"]
     end
 
-    subgraph OLAP["Doris 数仓"]
+    subgraph OLAP["Doris（存储与查询）"]
         ODS["ODS<br/>贴源 + binlog 元信息"]
         DWD["DWD<br/>明细宽表 / SCD2 拉链"]
         DWS["DWS<br/>分钟 · 小时 · 日汇总"]
@@ -49,8 +49,19 @@ flowchart LR
 
     MYSQL --> CDC --> FLINK
     GEN --> KAFKA --> FLINK
-    FLINK --> ODS --> DWD --> DWS --> ADS --> DASH
+    FLINK --> ODS
+    FLINK --> DWD
+    FLINK --> DWS
+    FLINK --> ADS
+    ODS -. 下游作业读取 .-> DWD
+    DWD -. 下游作业读取 .-> DWS
+    DWS -. 下游作业读取 .-> ADS
+    ADS --> DASH
 ```
+
+> 实线 = Flink SQL 写入；虚线 = 下游作业读出上游表再加工。**四层都是 Flink 算完写进 Doris 的，
+> Doris 内部不做层间加工**（没有物化视图链、没有定时调度）。这一点决定了「改一行 MySQL 到
+> 大屏变化」只需一条流，不依赖任何离线任务。
 
 ---
 

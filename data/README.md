@@ -2,7 +2,7 @@
 
 ## Olist Brazilian E-Commerce Public Dataset
 
-巴西电商平台 Olist 的真实脱敏交易数据，2016-09 ~ 2018-08，约 10 万笔订单。
+巴西电商平台 Olist 的真实脱敏交易数据，订单时间跨度 **2016-09-04 ~ 2018-10-17**（773 天），99,441 笔订单。
 
 - 来源：<https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce>
 - 协议：**CC BY-NC-SA 4.0**（署名 / 非商业 / 相同方式共享）

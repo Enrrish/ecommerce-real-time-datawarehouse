@@ -10,7 +10,7 @@ flink/
 │   │                            #            category_translation / geolocation
 │   ├── 03-ods-facts.sql         # 3 张明细表：order_items / order_payments / order_reviews
 │   └── 04-ods-user-event.sql    # Kafka topic user_event → ods_user_event
-├── checkpoints/                 # Checkpoint 落盘目录（bind mount 自 docker/volumes）
+├── checkpoints/                 # Checkpoint 落盘目录（按 job id 分子目录，已 gitignore）
 ├── lib/                         # 四个 connector jar（gitignore，见 scripts/fetch-flink-jars.sh）
 └── jobs/                        # 空。早期规划的目录名，已由 sql/ 取代，保留占位
 ```

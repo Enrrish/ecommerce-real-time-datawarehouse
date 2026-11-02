@@ -90,8 +90,8 @@ python scripts/gen_user_events.py --events 20000 --dup-rate 0.03
 设计要点：
 
 1. **实体用真实 ID**：`product_id` 取自 `olist_products`，`user_id` 取自
-   `customer_unique_id`。这样 `ods_user_event` 才能和 `dim_product` / `dim_user`
-   真 join 出品类漏斗，而不是自造 ID 再自己 join 自己。
+   `customer_unique_id`。这样 `ods_user_event` 才能和 `dim_product_zip` / `dim_user_zip`
+   （均带 `is_current=1`）真 join 出品类漏斗，而不是自造 ID 再自己 join 自己。
 2. **漏斗按商品独立转化**：一次会话浏览 1~3 个商品，每个商品各自走
    加购→提交→支付。对齐 `docs/03 §2`「同一用户同一商品分别计入各自环节」。
 3. **`event_time` 不晚于生产时刻**：会话起点在窗口内随机，末尾越界就把整段前移。

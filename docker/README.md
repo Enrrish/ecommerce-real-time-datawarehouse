@@ -13,7 +13,7 @@
 | `doris-fe` | `olap` | 1.5 GB | 8030 / 9030 | Web UI / MySQL 协议端口 |
 | `doris-be` | `olap` | 2.5 GB | 8040 | 单 BE，`replication_num=1` |
 
-合计约 **8.75 GB**，WSL 上限 10GB（`docs/04` §4），余量约 1GB 留给内核与 dockerd。
+合计约 **8.75 GB**，WSL 上限 10GB（`docs/04` §4），余量约 1.2GB 留给内核与 dockerd。
 
 `kafka-ui`（256 MB / 8080）暂不启用：用 `kafka-console-consumer.sh` 查积压即可，省一个容器。
 
@@ -44,11 +44,15 @@ docker compose --profile olap    up -d    # 最后起 Doris
 docker/
 ├── docker-compose.yml
 ├── .env.example          # 端口、密码、内存 limit 等可覆盖变量（.env 本身不入库）
-├── volumes/              # 数据目录：mysql/、kafka/、doris/、flink/（整目录不入库）
+├── volumes/              # 容器数据目录：mysql/、kafka/、doris-fe/、doris-be/（整目录不入库）
 ├── flink/
 │   └── lib/              # 四个 connector jar，由 scripts/fetch-flink-jars.sh 下载（不入库）
 └── doris/                # FE/BE 自定义配置（暂无，全部走环境变量）
 ```
+
+> **Flink 的 checkpoint 不在 `docker/volumes/` 下**，而是仓库根的 `flink/checkpoints/`
+> （compose 里写的是 `../flink/checkpoints:/opt/flink/checkpoints`）。原因是它属于
+> 计算状态而非容器数据，跟 `flink/sql/` 放一起更顺；已在 `.gitignore` 排除。
 
 建表 SQL 不放在 `docker/` 下，而是仓库根的 `sql/mysql/`：它同时被 compose 挂进容器（首次启动自动执行）和手工导入流程使用，放在通用位置才不用两头维护。`docker/mysql/init/` 这个方案已经弃用。
 
