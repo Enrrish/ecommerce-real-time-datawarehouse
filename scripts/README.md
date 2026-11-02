@@ -8,7 +8,8 @@ scripts/
 ├── prepare_load.py       # 原始 CSV → LOAD DATA 可读的 TSV
 ├── import.sh             # 一键：起 MySQL → 预处理 → 导入 → 验收
 ├── gen_user_events.py    # 合成埋点事件 → Kafka
-└── fetch-flink-jars.sh   # 下载 Flink 三件套 connector jar
+├── fetch-flink-jars.sh   # 下载 4 个 connector jar（含 MySQL JDBC 驱动）
+└── submit-sql.sh         # 提交 Flink SQL 作业并打印运行状态
 ```
 
 ## 依赖
@@ -110,24 +111,56 @@ python scripts/gen_user_events.py --events 20000 --dup-rate 0.03
 bash scripts/fetch-flink-jars.sh
 ```
 
-从 Maven 中央仓库拉三个 connector jar 到 `docker/flink/lib/`（约 50MB，已 gitignore）。
-三个 jar 是**版本强耦合**的，改任何一个都要回 `docs/04 §1` 重新核对：
+从 Maven 中央仓库拉 **4 个** jar 到 `docker/flink/lib/`（约 52MB，已 gitignore）。
+前三个是 connector，版本**强耦合**，改任何一个都要回 `docs/04 §1` 重新核对：
 
 | jar | 版本 | 强耦合点 |
 | --- | --- | --- |
 | `flink-sql-connector-mysql-cdc-3.2.1.jar` | 3.2.1 | 支持 Flink 1.17~1.19 |
 | `flink-sql-connector-kafka-3.1.0-1.18.jar` | 3.1.0-1.18 | 制品名带 Flink 次版本，必须 1.18 |
 | `flink-doris-connector-1.18-24.0.1.jar` | 24.0.1 | 同上，1.18 专用包 |
+| `mysql-connector-java-8.0.27.jar` | 8.0.27 | **不在上面任何一个 fat jar 里**，见下 |
 
-最隐蔽的是第三个：升级 Flink 忘了换它，集群能起、作业能提交，
-**第一条数据写 Doris 时**才报 `NoSuchMethodError`。脚本会校验文件名里的 `1.18`
-和文件头是否为 `PK`（防止下载到 HTML 错误页）。
+两个最隐蔽的坑：
+
+1. **Doris connector 的制品名带 Flink 次版本**。升级 Flink 忘了换它，集群能起、作业能提交，
+   第一条数据写 Doris 时才报 `NoSuchMethodError`。
+2. **MySQL JDBC 驱动必须单独放**。`flink-sql-connector-mysql-cdc` 因 GPLv2 许可刻意不打包它，
+   缺了之后作业**能编译、能提交、能拿到 Job ID**，只在 TaskManager 连库那一刻抛
+   `ClassNotFoundException: com.mysql.cj.jdbc.Driver`，报错文本完全不提"缺驱动"。
+
+脚本会校验文件名里的 `1.18` 和文件头是否为 `PK`（防止下载到 HTML 错误页）。
 
 Maven 中央慢的时候换镜像：
 
 ```bash
 MAVEN_MIRROR=https://maven.aliyun.com/repository/public bash scripts/fetch-flink-jars.sh --force
 ```
+
+---
+
+## `submit-sql.sh`
+
+```bash
+bash scripts/submit-sql.sh flink/sql/01-ods-orders.sql
+```
+
+提交一个 Flink SQL 文件（可含多条 `CREATE TABLE` + `INSERT`），然后打印作业是否真的 RUNNING。
+
+三个实现细节，都是踩坑后定下来的：
+
+| 做法 | 原因 |
+| --- | --- |
+| 先用 `docker cp` 把 SQL 送进 JM，再 `sql-client.sh -f` | 直接 `-f /tmp/x.sql` 会被 Git Bash 的 MSYS 路径改写毁掉，报 `Fail to read content from /opt/flink/C:/Users/.../job.sql` |
+| 每条命令加 `MSYS_NO_PATHCONV=1` | 同上，防止以 `/` 开头的参数被当成 Windows 路径 |
+| `--dry-run` 只拷贝不执行 | 改完 SQL 想先看一眼有没有语法问题，又不想污染集群时用 |
+
+> 脚本末尾打印的 `flink list` **不能当成功判据**：刚提交的作业它经常抓不到（读的是 CLI
+> 自己的缓存）。真正的判据是 REST 接口
+> `curl -s localhost:8081/jobs/overview`，看 `state` 是不是 `RUNNING`。
+
+> SQL 文件里必须有 `SET 'execution.attached' = 'false';`，否则 sql-client 挂在前台不退出，
+> 脚本一直等不到结束。
 
 ---
 

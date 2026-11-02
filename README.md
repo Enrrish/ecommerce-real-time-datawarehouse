@@ -25,13 +25,13 @@
 ```mermaid
 flowchart LR
     subgraph SRC["数据源"]
-        MYSQL[("MySQL 8<br/>Olist 业务库")]
-        GEN["埋点回放脚本<br/>replay_events.py"]
+        MYSQL[("MySQL 8.0.36<br/>Olist 业务库")]
+        GEN["埋点生成脚本<br/>gen_user_events.py"]
     end
 
     subgraph ING["采集层"]
         CDC["Flink CDC<br/>全量 + 增量快照"]
-        KAFKA[("Kafka<br/>ods_user_event")]
+        KAFKA[("Kafka 3.7.1<br/>topic: user_event")]
     end
 
     subgraph COMPUTE["计算层"]
@@ -56,15 +56,19 @@ flowchart LR
 
 ## 3. 技术栈
 
-| 组件 | 版本 | 角色 |
+版本不是各挑最新，而是从 Flink 反推出来的交集。选型理由与兼容性链路见 [docs/04 §1~§2](docs/04-环境搭建.md)。
+
+| 组件 | 锁定版本 | 角色 |
 | --- | --- | --- |
-| Apache Kafka | 3.x（KRaft 单节点） | 埋点日志消息队列 |
-| Apache Flink | 1.18+ | 流式计算引擎，全部作业使用 Flink SQL |
-| Flink CDC | 3.x | MySQL binlog 实时捕获 |
-| Apache Doris | 2.1+ | OLAP 存储与查询，承载四层数仓 |
-| MySQL | 8.0 | 业务库（OLTP 源） |
-| Docker / Compose | 24+ | 环境编排，profile 分层启动 |
-| Python | 3.11+ | 数据装载与埋点回放脚本 |
+| Apache Flink | **1.18.1**（scala 2.12 / JDK 11） | 流式计算引擎，全部作业使用 Flink SQL |
+| Flink CDC | **3.2.1** | MySQL binlog 实时捕获（+ JDBC 驱动 8.0.27，需单独放） |
+| Flink Kafka Connector | **3.1.0-1.18** | 埋点日志消费 |
+| Doris Flink Connector | **1.18-24.0.1** | 写入 Doris，Checkpoint 触发 Stream Load |
+| Apache Doris | **2.1.11**（单 FE 单 BE） | OLAP 存储与查询，承载四层数仓 |
+| Apache Kafka | **3.7.1**（KRaft 单节点） | 埋点日志消息队列 |
+| MySQL | **8.0.36** | 业务库（OLTP 源），binlog `ROW` + `FULL` |
+| Docker Desktop / Engine | **4.97.0 / 29.9.2** | 环境编排，profile 分层启动 |
+| Python | 3.11 | 数据装载与埋点生成脚本 |
 
 ---
 
@@ -75,13 +79,16 @@ flowchart LR
 ├── data/                  # 数据集（原始数据不入库，见 data/README.md）
 │   └── raw/olist/         # Olist 9 个 CSV，已 gitignore
 ├── docker/                # 容器编排与环境配置
+│   ├── docker-compose.yml # 三 profile：source / compute / olap
+│   ├── volumes/           # MySQL / Kafka / Doris / Flink 状态目录（gitignore）
+│   └── flink/lib/         # 四个 connector jar，由脚本下载（gitignore）
 ├── sql/
-│   ├── mysql/             # 业务库建表 + 初始化数据
-│   └── doris/             # ODS / DWD / DWS / ADS 建表
-├── flink/jobs/            # Flink SQL 作业，按分层编号
-├── scripts/               # 数据装载、埋点回放、脏数据注入
+│   ├── mysql/             # 业务库建表 01-schema + 验收 02-verify
+│   └── doris/             # ODS 建表 + 验收脚本（DWD 起后续补）
+├── flink/sql/             # Flink SQL 作业，按分层编号
+├── scripts/               # 数据装载、埋点生成、jar 下载、作业提交
 ├── dashboard/             # 实时大屏工程与导出图
-└── docs/                  # 架构、分层模型、指标口径
+└── docs/                  # 架构、分层模型、指标口径、环境、路线图
 ```
 
 ---
@@ -112,12 +119,13 @@ flowchart LR
 - [x] 数仓分层模型与指标口径设计
 - [x] 实时大屏视觉稿
 - [x] 环境搭建（WSL2 + Docker Desktop + 镜像加速）
-- [ ] Docker Compose 编排（profile 分层启动）
-- [ ] MySQL 业务库建表与 Olist 数据装载
-- [ ] Flink CDC 接入 ODS（全量 + 增量）
-- [ ] 埋点回放脚本与脏数据注入
-- [ ] DWD / DWS / ADS 分层作业
-- [ ] Doris 两阶段提交与端到端延迟压测
+- [x] Docker Compose 编排（profile 分层启动）
+- [x] MySQL 业务库建表与 Olist 数据装载（155 万行，九表 diff 全 0）
+- [x] Flink CDC 接入 ODS（9 张表全量 + 增量，端到端 3.8s）
+- [x] 埋点生成脚本与去重验证（3% 重复注入，唯一键吃干净）
+- [ ] DWD 明细层（交易宽表 / 行为清洗 / SCD2 维表）
+- [ ] DWS / ADS 分层作业
+- [ ] 脏数据注入与指标基线对照
 - [ ] 大屏接入 ADS 实数据
 
 ---
@@ -128,9 +136,10 @@ flowchart LR
 
 16GB 内存是本项目的主要约束，因此：
 
-- 容器按 `source` / `compute` / `olap` 三组 profile 分批启动，不要求全量常驻
-- Doris 单 BE、单副本（`replication_num=1`）、BE 内存上限 4G
-- Flink 并行度按 2~4 配置，Checkpoint 落本地文件系统
+- WSL2 上限锁 10GB，六个容器 limit 合计 **8.75GB**（明细见 [docs/04 §4](docs/04-环境搭建.md)）
+- 容器按 `source` / `compute` / `olap` 三组 profile 分批启动，避免 BE 与 TM 同时拉起触发 OOM Killer
+- Doris 单 BE、单副本（`replication_num=1`）、BE 内存上限 2.5G
+- Flink 单 TM / 10 slots，每个作业并行度 1（10 个作业占满），Checkpoint 10s 落本地文件系统
 
 ---
 
