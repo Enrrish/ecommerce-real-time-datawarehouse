@@ -61,6 +61,10 @@ dist/
 flink/checkpoints/
 flink/savepoints/
 *.hprof
+# Flink connector jar（约 50MB，由 scripts/fetch-flink-jars.sh 按固定版本下载）
+# 已被上面的 *.jar 覆盖，这里仅作说明：不要手工往 docker/flink/lib/ 里塞 jar
+docker/flink/lib/*.jar
+!docker/flink/lib/.gitkeep
 
 # ============================================================
 # Docker 挂载卷（容器持久化目录）
@@ -92,3 +96,5 @@ desktop.ini
 *.tmp
 *.bak
 *.swp
+# 下载中的半成品（fetch-flink-jars.sh 下载完会 mv 成正式文件名）
+*.part

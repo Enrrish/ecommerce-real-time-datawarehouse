@@ -5,9 +5,10 @@
 ```
 scripts/
 ├── requirements.txt
-├── prepare_load.py      # 原始 CSV → LOAD DATA 可读的 TSV
-├── import.sh            # 一键：起 MySQL → 预处理 → 导入 → 验收
-└── gen_user_events.py   # 合成埋点事件 → Kafka
+├── prepare_load.py       # 原始 CSV → LOAD DATA 可读的 TSV
+├── import.sh             # 一键：起 MySQL → 预处理 → 导入 → 验收
+├── gen_user_events.py    # 合成埋点事件 → Kafka
+└── fetch-flink-jars.sh   # 下载 Flink 三件套 connector jar
 ```
 
 ## 依赖
@@ -100,6 +101,33 @@ python scripts/gen_user_events.py --events 20000 --dup-rate 0.03
 
 实测（2 万条，`--seed 20261030`）：`page_view` 77.9% / `add_cart` 14.5% /
 `checkout` 5.0% / `pay` 2.6%，支付转化率 3.36%，投递 11,810 条/秒。
+
+---
+
+## `fetch-flink-jars.sh`
+
+```bash
+bash scripts/fetch-flink-jars.sh
+```
+
+从 Maven 中央仓库拉三个 connector jar 到 `docker/flink/lib/`（约 50MB，已 gitignore）。
+三个 jar 是**版本强耦合**的，改任何一个都要回 `docs/04 §1` 重新核对：
+
+| jar | 版本 | 强耦合点 |
+| --- | --- | --- |
+| `flink-sql-connector-mysql-cdc-3.2.1.jar` | 3.2.1 | 支持 Flink 1.17~1.19 |
+| `flink-sql-connector-kafka-3.1.0-1.18.jar` | 3.1.0-1.18 | 制品名带 Flink 次版本，必须 1.18 |
+| `flink-doris-connector-1.18-24.0.1.jar` | 24.0.1 | 同上，1.18 专用包 |
+
+最隐蔽的是第三个：升级 Flink 忘了换它，集群能起、作业能提交，
+**第一条数据写 Doris 时**才报 `NoSuchMethodError`。脚本会校验文件名里的 `1.18`
+和文件头是否为 `PK`（防止下载到 HTML 错误页）。
+
+Maven 中央慢的时候换镜像：
+
+```bash
+MAVEN_MIRROR=https://maven.aliyun.com/repository/public bash scripts/fetch-flink-jars.sh --force
+```
 
 ---
 
