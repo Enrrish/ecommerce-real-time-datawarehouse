@@ -82,7 +82,7 @@ FROM (
          (SELECT COUNT(*) FROM dws_traffic_funnel_1h),
          (SELECT COUNT(*) FROM (SELECT DISTINCT dt, hour, step FROM (
                 SELECT DATE(event_time) dt, HOUR(event_time) hour, event_type step
-                FROM dwd_user_event_clean) e) x)
+                FROM dwd_user_event_clean WHERE is_valid = 1) e) x)
 ) t
 ORDER BY `指标`;
 
@@ -145,8 +145,15 @@ UNION ALL SELECT '-- 基准：COUNT(DISTINCT order_id) 全表 --', COUNT(DISTINC
 -- -----------------------------------------------------------------------------
 -- 五、漏斗：pv 必须等于 DWD 去重后的行数
 -- -----------------------------------------------------------------------------
--- 直接从 Kafka 聚合会得到 22,064（多了 60 条重复 event_id）。09 号作业里加了
--- ROW_NUMBER 去重视图，正确值是 22,004。这一项如果对不上，先查去重视图有没有生效。
+-- **基准必须带 `WHERE is_valid = 1`。** DWD 保留了两类行：① 有效事件；
+-- ② 字段缺失/类型非法的事件（标 `is_valid = 0` 留作证据，不物理删除）。
+-- DWS 漏斗直连 Kafka，用的是自己的过滤条件（user_id / session_id 非空 +
+-- event_type 在白名单内），同样会挡掉这些行 —— 所以基准也要挡住，否则
+-- 会恒定多出「脏数据条数」的 diff。P6 注入 2 条字段级脏数据后这里实测差 2。
+--
+-- 上面的数字不要写死：DWS 直连 Kafka 聚合会得到「Kafka 消息数」（含重复
+-- event_id），09 号作业里加了 ROW_NUMBER 去重视图后才是「唯一事件数」。
+-- 判据只有一个 ——**DWS 的 pv 等于 DWD 的 is_valid=1 行数**。
 SELECT '5. 漏斗 pv / uv' AS `校验项`;
 SELECT
   metric                                                                     AS `指标`,
@@ -156,13 +163,13 @@ SELECT
 FROM (
   SELECT 'funnel.pv' AS metric,
          (SELECT SUM(pv) FROM dws_traffic_funnel_1h)                         AS dws,
-         (SELECT COUNT(*) FROM dwd_user_event_clean)                         AS dwd
+         (SELECT COUNT(*) FROM dwd_user_event_clean WHERE is_valid = 1)      AS dwd
   UNION ALL
   SELECT 'funnel.uv',
          (SELECT SUM(uv) FROM dws_traffic_funnel_1h),
          (SELECT SUM(uv) FROM (SELECT DATE(event_time) dt, HOUR(event_time) hour,
                                       event_type step, COUNT(DISTINCT user_id) uv
-                               FROM dwd_user_event_clean GROUP BY 1,2,3) x)
+                               FROM dwd_user_event_clean WHERE is_valid = 1 GROUP BY 1,2,3) x)
 ) t
 ORDER BY `指标`;
 
