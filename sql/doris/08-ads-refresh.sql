@@ -24,6 +24,7 @@
 --   3. ads_funnel_1d           ← dwd_user_event_clean（回明细重算 UV）
 --   4. ads_payment_method_1d   ← dws_payment_method_1d
 --   5. ads_order_stream        ← dwd_trade_order_detail（收敛到订单粒度）
+--   6. ads_region_map_1d       ← dws_trade_region_1d + dim_geo（补坐标）
 --
 -- ads_pipeline_health 不在这里 —— 它的数据源跨 Doris / Flink / Kafka 三个系统，
 -- 由 scripts/collect-pipeline-health.sh 统一采集写入。
@@ -218,3 +219,94 @@ SELECT
   NOW() AS `update_time`
 FROM `dwd_trade_order_detail`
 GROUP BY `order_id`;
+
+
+-- -----------------------------------------------------------------------------
+-- 6. ads_region_map_1d —— 地域地图 + 州名 + 州中心坐标
+-- -----------------------------------------------------------------------------
+-- 两个 LEFT JOIN 都是必需的，且都不能写成 INNER JOIN：
+--
+--   * 州名映射   27 行常量。写 INNER 的话，一旦某个州漏在映射表里，
+--                它整天的数据会从地图上凭空消失 —— 而地图看起来只是少一块色，
+--                没人会怀疑到 SQL 上。
+--   * 州中心坐标 从 dim_geo 现算。写 INNER 的后果同上。
+--
+-- 两个 JOIN 都用 LEFT，缺失时留 NULL。大屏渲染遇到 NULL 会显示成"无数据"，
+-- 比"整块消失"更容易被发现。
+--
+-- 州名用内联常量表而不是再建一张维表：27 个值是稳定的行政区划，不会变；
+-- 为它多一张 DWD 维表要改分层模型、要加装载脚本，收益为零。
+--
+-- 坐标那段的 `BETWEEN -34 AND 6 AND lng BETWEEN -74 AND -34` 不是随手写的数字，
+-- 是巴西的经纬度边界。dim_geo 里有 11 个越界点（PA 的纬度跑到北纬 22 度、
+-- PR 的经纬度串了位），不过滤的话这几州的中心点会被拉到海里。详见 07-ads.sql
+-- 第 7 张表的注释。
+INSERT OVERWRITE TABLE `ads_region_map_1d`
+SELECT
+  r.`dt`,
+  r.`customer_state`,
+  m.`state_name`,
+
+  CAST(r.`gmv` AS DECIMAL(20,2))                            AS `gmv`,
+  CAST(r.`freight_total` AS DECIMAL(20,2))                  AS `freight_total`,
+  r.`item_cnt`,
+  r.`order_cnt`,
+  r.`buyer_cnt`,
+
+  CAST(r.`gmv` AS DECIMAL(20,6)) / NULLIF(r.`order_cnt`, 0) AS `aov`,
+  CAST(r.`freight_total` AS DECIMAL(20,6)) / NULLIF(r.`gmv`, 0) AS `freight_ratio`,
+
+  CAST(r.`gmv` AS DECIMAL(20,6))
+    / NULLIF(SUM(r.`gmv`) OVER (PARTITION BY r.`dt`), 0)    AS `gmv_ratio`,
+  ROW_NUMBER() OVER (PARTITION BY r.`dt` ORDER BY r.`gmv` DESC NULLS LAST) AS `gmv_rank`,
+
+  CAST(g.`c_lat` AS DECIMAL(10,6))                          AS `center_lat`,
+  CAST(g.`c_lng` AS DECIMAL(10,6))                          AS `center_lng`,
+
+  NOW() AS `update_time`
+FROM `dws_trade_region_1d` r
+LEFT JOIN (
+            SELECT 'AC' AS `sc`, 'Acre'               AS `state_name`
+  UNION ALL SELECT 'AL', 'Alagoas'
+  UNION ALL SELECT 'AP', 'Amapá'
+  UNION ALL SELECT 'AM', 'Amazonas'
+  UNION ALL SELECT 'BA', 'Bahia'
+  UNION ALL SELECT 'CE', 'Ceará'
+  UNION ALL SELECT 'DF', 'Distrito Federal'
+  UNION ALL SELECT 'ES', 'Espírito Santo'
+  UNION ALL SELECT 'GO', 'Goiás'
+  UNION ALL SELECT 'MA', 'Maranhão'
+  UNION ALL SELECT 'MT', 'Mato Grosso'
+  UNION ALL SELECT 'MS', 'Mato Grosso do Sul'
+  UNION ALL SELECT 'MG', 'Minas Gerais'
+  UNION ALL SELECT 'PA', 'Pará'
+  UNION ALL SELECT 'PB', 'Paraíba'
+  UNION ALL SELECT 'PR', 'Paraná'
+  UNION ALL SELECT 'PE', 'Pernambuco'
+  UNION ALL SELECT 'PI', 'Piauí'
+  UNION ALL SELECT 'RJ', 'Rio de Janeiro'
+  UNION ALL SELECT 'RN', 'Rio Grande do Norte'
+  UNION ALL SELECT 'RS', 'Rio Grande do Sul'
+  UNION ALL SELECT 'RO', 'Rondônia'
+  UNION ALL SELECT 'RR', 'Roraima'
+  UNION ALL SELECT 'SC', 'Santa Catarina'
+  UNION ALL SELECT 'SP', 'São Paulo'
+  UNION ALL SELECT 'SE', 'Sergipe'
+  UNION ALL SELECT 'TO', 'Tocantins'
+) m ON r.`customer_state` = m.`sc`
+LEFT JOIN (
+  -- 按州收敛成一个中心点：先滤掉越界点，再按 point_cnt 加权平均。
+  -- 分母为 0（整州的点全越界）时返回 NULL，而不是让整个 INSERT 抛除零错误。
+  SELECT `state`,
+         SUM(CASE WHEN `lat` BETWEEN -34 AND 6 AND `lng` BETWEEN -74 AND -34
+                  THEN `lat` * `point_cnt` ELSE 0 END)
+           / NULLIF(SUM(CASE WHEN `lat` BETWEEN -34 AND 6 AND `lng` BETWEEN -74 AND -34
+                             THEN `point_cnt` ELSE 0 END), 0) AS `c_lat`,
+         SUM(CASE WHEN `lat` BETWEEN -34 AND 6 AND `lng` BETWEEN -74 AND -34
+                  THEN `lng` * `point_cnt` ELSE 0 END)
+           / NULLIF(SUM(CASE WHEN `lat` BETWEEN -34 AND 6 AND `lng` BETWEEN -74 AND -34
+                             THEN `point_cnt` ELSE 0 END), 0) AS `c_lng`
+  FROM `dim_geo`
+  GROUP BY `state`
+) g ON r.`customer_state` = g.`state`
+WHERE r.`gmv` IS NOT NULL;

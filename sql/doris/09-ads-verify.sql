@@ -1,10 +1,10 @@
 -- =============================================================================
--- 09-ads-verify.sql —— P6 验收：ADS 6 张表 vs 上游重算
+-- 09-ads-verify.sql —— P6 验收：ADS 7 张表 vs 上游重算
 -- -----------------------------------------------------------------------------
 -- 执行：MSYS_NO_PATHCONV=1 docker exec -i rt-doris-fe \
 --         mysql -h127.0.0.1 -P9030 -uroot < sql/doris/09-ads-verify.sql
 --
--- 验收标准：**第一节到第六节的所有 diff 必须是 0**。
+-- 验收标准：**第一节到第六节、第十一节的所有 diff 必须是 0**。
 -- 第七、八、九节是「预期不等」的项，不判 diff，只把数字并排列出来，
 -- 用来说明口径差异是设计使然，不是算错了。
 --
@@ -51,16 +51,24 @@ FROM (
   SELECT 'order_stream.rows',
          (SELECT COUNT(*) FROM ads_order_stream),
          (SELECT COUNT(DISTINCT order_id) FROM dwd_trade_order_detail)
+  UNION ALL
+  SELECT 'region_map_1d.rows',
+         (SELECT COUNT(*) FROM ads_region_map_1d),
+         (SELECT COUNT(*) FROM dws_trade_region_1d WHERE gmv IS NOT NULL)
 ) t
 ORDER BY `指标`;
 
 
 -- -----------------------------------------------------------------------------
--- 二、GMV：三张交易系 ADS 表必须全部等于 15,843,553.24
+-- 二、GMV：四张交易系 ADS 表必须全部等于 15,843,553.24
 -- -----------------------------------------------------------------------------
 -- 这是全链路唯一允许的 GMV 定义 = SUM(item_total)，含运费、不剔除取消单。
 -- docs/03 §1 已按此修正（原文档写的「SUM(price) 不含运费、剔除取消」与实现
 -- 差 234 万，P6 开工时发现并统一到实现口径）。
+--
+-- 实时概览、品类排行、订单流水、地域地图这四张都从交易明细派生，四张的
+-- SUM(gmv) 必须完全相等 —— 这是「同一份 GMV 被切成四种形状」的证据。
+-- （支付方式表不在其中：它的口径是支付流水，见第三节。）
 --
 -- 注：基线的绝对数值会随 P6 的脏数据注入变化（目前 25,005 条埋点、11 万条交易是
 -- 注入后的状态），所以这里不硬编码数字，而是与 DWD 重算实时对比。
@@ -81,6 +89,10 @@ FROM (
   UNION ALL
   SELECT 'order_stream.gmv',
          (SELECT SUM(gmv) FROM ads_order_stream),
+         (SELECT SUM(item_total) FROM dwd_trade_order_detail)
+  UNION ALL
+  SELECT 'region_map_1d.gmv',
+         (SELECT SUM(gmv) FROM ads_region_map_1d),
          (SELECT SUM(item_total) FROM dwd_trade_order_detail)
 ) t
 ORDER BY `指标`;
@@ -255,3 +267,88 @@ ORDER BY metric_group, metric_key;
 SELECT '   指标总数（应为 10）' AS `说明`, COUNT(*) AS `实际`,
        SUM(CASE WHEN metric_level IN ('ok','warn','critical') THEN 0 ELSE 1 END) AS `非法级别的个数（须为 0）`
 FROM ads_pipeline_health;
+
+
+-- -----------------------------------------------------------------------------
+-- 十一、地域地图表：维度完整性 / 坐标有效性 / 占比精度
+-- -----------------------------------------------------------------------------
+-- 这张表比别的 ADS 表多三类要验的东西，全都属于「行数和 GMV 都对得上，
+-- 但地图画出来是错的」——只跑前几节发现不了：
+--
+--   1. **维度完整性。** state_name 和 center_lat/lng 都是 LEFT JOIN 进来的，
+--      漏一个州不会让行数或 GMV 变，只会让地图凭空少一块色、或气泡飘到海里。
+--      用 LEFT JOIN 就是为了让缺失表现为 NULL 而不是静默丢行，这里再验 NULL 为 0。
+--
+--   2. **坐标有效性。** dim_geo 里混着 11 个越界点（PA 的纬度在北纬 22 度、
+--      PR 的经纬度和经度串位）。刷新时按巴西边界过滤过，但过滤条件写错了
+--      不会有任何报错 —— 只会让某个州的重心偏出去几度。所以结果范围也要验。
+--
+--   3. **占比精度。** 这是唯一一个「看起来像 bug 的正确答案」：单日 17 个州，
+--      每州的 gmv_ratio 保留 4 位小数，累积误差最大 17 × 0.00005 = 0.00085，
+--      所以 SUM(gmv_ratio) 会在 0.9997~1.0004 之间浮动。**判据必须是
+--      ROUND(x,3)=1.000**，用 0.0001 会误报 409 天为异常。
+SELECT '11. 地域地图表完整性' AS `校验项`;
+SELECT
+  `指标`,
+  `实际`,
+  `预期`
+FROM (
+  SELECT 'rows（应 = dws_trade_region_1d）' AS `指标`,
+         (SELECT COUNT(*) FROM `ads_region_map_1d`) AS `实际`,
+         (SELECT COUNT(*) FROM `dws_trade_region_1d` WHERE `gmv` IS NOT NULL) AS `预期`
+  UNION ALL
+  SELECT 'distinct_states', (SELECT COUNT(DISTINCT `customer_state`) FROM `ads_region_map_1d`), 27
+  UNION ALL
+  SELECT 'null_state_name', (SELECT COUNT(*) FROM `ads_region_map_1d` WHERE `state_name` IS NULL), 0
+  UNION ALL
+  SELECT 'null_coord', (SELECT COUNT(*) FROM `ads_region_map_1d`
+                        WHERE `center_lat` IS NULL OR `center_lng` IS NULL), 0
+  UNION ALL
+  SELECT 'coord_outside_brazil', (SELECT COUNT(*) FROM `ads_region_map_1d`
+                                  WHERE `center_lat` NOT BETWEEN -34 AND 6
+                                     OR `center_lng` NOT BETWEEN -74 AND -34), 0
+  UNION ALL
+  SELECT 'ratio_sum_bad_days', (SELECT COUNT(*) FROM (
+            SELECT `dt`, SUM(`gmv_ratio`) s FROM `ads_region_map_1d` GROUP BY `dt`) x
+          WHERE ROUND(s, 3) <> 1.000), 0
+  UNION ALL
+  SELECT 'rank_gap_days', (SELECT COUNT(*) FROM (
+            SELECT `dt`, MIN(`gmv_rank`) mn, MAX(`gmv_rank`) mx, COUNT(*) c
+            FROM `ads_region_map_1d` GROUP BY `dt`) y
+          WHERE mn <> 1 OR mx <> c), 0
+) t;
+
+SELECT '   与 dws_trade_region_1d 逐日对照' AS `说明`;
+SELECT COUNT(*)                                                       AS `核对天数`,
+       SUM(CASE WHEN ABS(a.gmv - b.gmv) > 0.01 THEN 1 ELSE 0 END)     AS `GMV 不一致天数（须 0）`,
+       SUM(CASE WHEN a.oc <> b.oc THEN 1 ELSE 0 END)                  AS `订单数不一致天数（须 0）`,
+       SUM(CASE WHEN a.ic <> b.ic THEN 1 ELSE 0 END)                  AS `件数不一致天数（须 0）`,
+       SUM(CASE WHEN a.bc <> b.bc THEN 1 ELSE 0 END)                  AS `买家数不一致天数（须 0）`
+FROM (SELECT `dt`, SUM(`gmv`) gmv, SUM(`order_cnt`) oc, SUM(`item_cnt`) ic, SUM(`buyer_cnt`) bc
+      FROM `ads_region_map_1d` GROUP BY `dt`) a
+JOIN (SELECT `dt`, SUM(`gmv`) gmv, SUM(`order_cnt`) oc, SUM(`item_cnt`) ic, SUM(`buyer_cnt`) bc
+      FROM `dws_trade_region_1d` GROUP BY `dt`) b
+  ON a.`dt` = b.`dt`;
+
+-- 这一项不是校验，是给大屏的说明：地图上永远有空白块。
+-- 实测 616 天里没有任何一天是 27 个州全有成交（最多 26 个，平均 17.4 个），
+-- 北部 RR / AP / AC / RO 人口太少，不是每天都有单。空白是数据特性，不是缺数。
+SELECT '   单日有成交州数（解释地图为何有空白）' AS `说明`;
+SELECT MIN(c) AS `最少`, MAX(c) AS `最多`, ROUND(AVG(c), 1) AS `平均`,
+       SUM(CASE WHEN c = 27 THEN 1 ELSE 0 END) AS `27 州全满的天数（实测 0）`
+FROM (SELECT `dt`, COUNT(*) c FROM `ads_region_map_1d` GROUP BY `dt`) x;
+
+-- 与 order_cnt 不同，**buyer_cnt 连跨州相加都不行**（order_cnt 一单只归一个州，
+-- 可加；买家是自然人，可能换州）。直觉上「一个人只住一个州」是错的：实测有
+-- 37 个自然人在两个州下过单。这是写字段注释时断言「跨州可加」、跑一次验证
+-- 发现被打脸后补上的检查 —— **可加性不能凭直觉，得跑数据**。
+SELECT '12. 【预期不等】买家数不可跨桶相加' AS `说明`;
+SELECT (SELECT SUM(`buyer_cnt`) FROM `ads_region_map_1d`)                            AS `SUM(buyer_cnt)`,
+       (SELECT COUNT(DISTINCT `customer_unique_id`) FROM `dwd_trade_order_detail`)    AS `全期去重买家数`,
+       (SELECT SUM(`buyer_cnt`) FROM `ads_region_map_1d`)
+         - (SELECT COUNT(DISTINCT `customer_unique_id`) FROM `dwd_trade_order_detail`) AS `偏大值（跨天为主）`,
+       (SELECT COUNT(*) FROM (
+          SELECT `customer_unique_id` FROM `dwd_trade_order_detail`
+          WHERE `customer_unique_id` IS NOT NULL
+          GROUP BY `customer_unique_id`
+          HAVING COUNT(DISTINCT `customer_state`) > 1) x)                            AS `跨州下单人数（实测 37）`;
