@@ -56,10 +56,20 @@ STATS = {"last_ok": 0.0, "served": 0, "errors": 0, "last_error": ""}
 REFRESH_STATE = {"funnel": 0.0, "health": 0.0, "full": 0.0, "today": 0.0,
                  "funnel_err": 0, "today_err": 0}
 
-# full 档是 INSERT OVERWRITE（先清表再写），与 today 档的 INSERT INTO 并发跑时，
-# 后者的行可能正好落在「已清空、未写完」的窗口里被吞掉，表现为数字偶尔倒退。
-# 两档互斥后，today 最多被一次全量刷新阻塞 2.6 s。
-REFRESH_LOCK = threading.Lock()
+# 三档刷新写两张表，冲突关系不一样，所以用两把锁而不是一把：
+#
+#   ads_realtime_overview ← today(每秒) + full(60秒)   → 需要互斥
+#   ads_funnel_1d         ← funnel(2秒) + full(60秒)   → 需要互斥
+#   today 与 funnel 写不同的表                          → 不必互斥
+#
+# 一开始图省事只用一把锁，结果是 funnel 卡住时 today 跟着饿死：埋点数据涨到
+# 7.7 万行后 funnel 的 multi-distinct 要跑十几秒，today 的 1 秒周期完全失效，
+# 大屏顶栏的「今日」就不动了 —— 修一个并发问题换来一个更难查的可用性问题。
+#
+# full 同时写两张表，必须两把锁都拿。固定「先 FUNNEL 后 OVERVIEW」的获取顺序，
+# 否则 full 与 funnel/today 交叉时会死锁。
+FUNNEL_LOCK = threading.Lock()
+OVERVIEW_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +125,23 @@ WHERE `gmv` IS NOT NULL AND `dt` = CURDATE()
 def _run_today_refresh() -> None:
     """只覆盖「今天」那几行。UNIQUE 表上 INSERT INTO 就是按 (dt, minute) 覆盖，
     行数少所以是毫秒级；历史 8.8 万行交给 full 档 60 s 一次兜底。"""
-    with REFRESH_LOCK:
+    with OVERVIEW_LOCK:
         DORIS_W.query(TODAY_REFRESH_SQL)
 
 
+def _run_funnel_refresh() -> None:
+    """漏斗刷新。这把锁只跟 full 档抢 —— full 也 OVERWRITE 同一张 ads_funnel_1d，
+    两边都是「先清分区再写」，并发时会互相删行。
+
+    注意它不跟 today 抢锁：两者写不同的表，而 funnel 的 multi-distinct 在
+    埋点表涨到十万级后可能要十几秒，共用一把锁会把 today 饿死。"""
+    with FUNNEL_LOCK:
+        DORIS_W.query(FUNNEL_REFRESH_SQL)
+
+
 def _run_full_refresh() -> None:
-    with REFRESH_LOCK:
+    # 顺序固定为 FUNNEL → OVERVIEW，与上面两个函数的获取顺序一致，避免死锁
+    with FUNNEL_LOCK, OVERVIEW_LOCK:
         _run_sql_file("sql/doris/08-ads-refresh.sql")
 
 
@@ -198,7 +219,7 @@ def start_refreshers() -> None:
         daemon=True, name="refresh-today",
     ).start()
     threading.Thread(
-        target=_loop, args=("funnel", 2.0, lambda: DORIS_W.query(FUNNEL_REFRESH_SQL)),
+        target=_loop, args=("funnel", 2.0, _run_funnel_refresh),
         daemon=True, name="refresh-funnel",
     ).start()
     threading.Thread(

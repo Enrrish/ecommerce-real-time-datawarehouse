@@ -28,6 +28,10 @@ from collections import deque
 
 CONTAINER = "rt-doris-fe"
 SENTINEL = "__END_OF_QUERY__"
+# 单条语句的服务端超时（秒）。Doris 默认 300s，等于没有 —— BE 一旦被
+# 内存压力拖住，大屏的 readline 会一直等到 5 分钟。5s 足够跑完本项目
+# 最重的全量刷新（实测 2.6s），又能在卡住时快速失败。
+INIT_SQL = "SET query_timeout = 5"
 
 _CMD = [
     "docker", "exec", "-i", CONTAINER,
@@ -78,6 +82,21 @@ class Doris:
         # stderr 必须有人读，否则管道写满后 mysql 会阻塞在写错误信息上，
         # 表现为「查询既不出结果也不退出」。守护线程只保留最后几条。
         threading.Thread(target=self._drain_err, args=(proc,), daemon=True).start()
+
+        # 建连后先设语句超时。没有它的时候，Doris BE 内存不足会把语句挂住
+        # 不返回，readline 无限等 → 整屏永久冻结、只能重启服务（server.log
+        # 里两次 120 s 的 TimeoutExpired 就是这么来的）。
+        # query_timeout 以秒计，超时后 FE 主动返回 ERROR，readline 立刻可读，
+        # 再经 stderr 排泄线程变成一条 DorisError —— 面板显示「取数失败」
+        # 而不是转圈，比整屏卡死好得多。
+        try:
+            assert proc.stdin and proc.stdout
+            proc.stdin.write(f"{INIT_SQL};\nSELECT '{SENTINEL}';\n".encode("utf-8"))
+            for raw in iter(proc.stdout.readline, b""):
+                if raw.decode("utf-8", "replace").strip() == SENTINEL:
+                    break
+        except Exception:            # noqa: BLE001 - 初始化失败不该挡住启动
+            pass
         return proc
 
     def _drain_err(self, proc: subprocess.Popen) -> None:

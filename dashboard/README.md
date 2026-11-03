@@ -76,7 +76,59 @@ python scripts/gen_user_events.py --live 2 --sessions 3   # 每 2 秒新开 3 �
 | `health` | 15 s | `scripts/collect-pipeline-health.sh` | 要跨 Flink / Kafka / Doris 三处采集，单次约 3 s |
 | `full` | 60 s | `sql/doris/08-ads-refresh.sql` 全量 7 张表 | 8.8 万 + 9.9 万行，刷一次 2.6 s。交易数据是历史回放，本来就不变 |
 
-`today` 与 `full` 用一把锁互斥：`full` 是 `INSERT OVERWRITE`（先清表再写），与 `today` 的 `INSERT INTO` 并发时，后者的行可能落在「已清空、未写完」的窗口里被吞掉，表现为数字偶尔倒退。
+刷新写两张表，冲突关系不一样，所以是**两把锁**而不是一把：
+
+| 表 | 谁写 | 锁 |
+| --- | --- | --- |
+| `ads_realtime_overview` | `today`(1s) + `full`(60s) | `OVERVIEW_LOCK` |
+| `ads_funnel_1d` | `funnel`(2s) + `full`(60s) | `FUNNEL_LOCK` |
+
+`full` 是 `INSERT OVERWRITE`（先清表再写），与另一档的 `INSERT INTO` 并发时，后者的行会落在「已清空、未写完」的窗口里被吞掉，表现为数字偶尔倒退。`full` 两把锁都拿，获取顺序固定 **先 FUNNEL 后 OVERVIEW**，否则会死锁。
+
+一开始图省事只用了**一把**锁，结果是 `funnel` 卡住时 `today` 跟着饿死：埋点表涨到 7.7 万行后漏斗的 multi-distinct 要跑十几秒，`today` 的 1 秒周期完全失效，顶栏「今日」不动。**修一个并发问题换来一个更难查的可用性问题。**
+
+## 头号陷阱：1 秒 flush 会把 Doris 版本打爆
+
+P7 为了把「埋点发出 → 大屏看见」从 13 秒压到 1~3 秒，给 04/06/09 三个作业都加了
+`sink.buffer-flush.interval = '1s'`。当时 09 号的注释里甚至写了「代价是每秒一次
+Stream Load，Doris 侧版本变多、compaction 压力上升；演示环境可接受」。
+
+**这个判断是错的。** 埋点连跑 3 小时后的实测：
+
+| 表 | 单 tablet 版本数 | `COUNT(*) GROUP BY dt, event_type` |
+| --- | --- | --- |
+| `ods_user_event` | 1,524 | — |
+| `dwd_user_event_clean` | **4,434** | **28,000 ms** |
+| `dws_traffic_funnel_1h` | **6,276**（只有 56 行数据） | — |
+| `dws_trade_overview_1m` | 17（没有数据流，正常） | 快 |
+
+因果链：Doris 每收一次 Stream Load 就生成一个数据版本 → 1 秒一次 = 每秒一个版本 →
+BE 内存顶到 2.25 GB 上限（`Process memory not enough`）→ compaction 抢不到内存，
+`last cumulative success time` 停在 08:19，**之后完全停摆** → 查询要把 4,434 个
+rowset 全 merge 一遍 → 7.7 万行的表读不动。
+
+它不会在第一次跑起来时报错，只会在大屏连续挂几小时后「越用越慢」，然后漏斗面板
+的刷新周期从 2 秒滑到十几秒。**这类退化没有报错，只有变慢。**
+
+处置：
+
+1. 04/06/09 的 `sink.buffer-flush.interval` 全部改回 **10s**（与 checkpoint 间隔一致）。
+   漏斗是累计值，多等 10 秒不影响可读性；查询慢 28 秒是致命的。
+   07 保持 1s —— 它只在有交易时写，不产生持续版本流。
+2. 已经堆积的版本清不掉（compaction 已停摆），只能 `TRUNCATE` 三张表让 Flink 从
+   Kafka 重放（`earliest-offset`，77,948 条）：
+
+   ```sql
+   TRUNCATE TABLE ods_user_event;
+   TRUNCATE TABLE dwd_user_event_clean;
+   TRUNCATE TABLE dws_traffic_funnel_1h;
+   ```
+
+   然后重新提交 04/06/09。重放后行数与清空前逐表一致（77,798 / 77,798 / 56），
+   版本数从 4,434 降到 5，`GROUP BY` 从 28,000 ms 降到 1,063 ms。
+
+**经验**：Doris 的导入频率不要低于 10 秒。实时性应该靠「查询侧高频刷新 + 表足够小」
+来拿，不能靠「把写入频率推到秒级」—— 后者是在向存储引擎借时间，几小时后连本带利还回来。
 
 ## 技术选型：为什么手写 SVG 而不是 ECharts
 
@@ -129,7 +181,22 @@ bash dashboard/p7-acceptance.sh          # 插一条今日订单，逐层观测�
 bash dashboard/p7-acceptance.sh --clean  # 只清理
 ```
 
-实测 13 轮：改 MySQL → 大屏顶栏数字变化 **237 ~ 3,086 ms**。
+实测：改 MySQL → 大屏顶栏数字变化 **294 / 3,883 / 4,007 / 4,019 ms**，全部在 5 秒内。
+
+脚本自己给 PASS/FAIL 并返回退出码（`0` 通过 / `1` 失败 / `2` 参数错），可以直接挂 CI。
+
+### 为什么脚本里对「查询失败」这么警惕
+
+上一版是这样写的：
+
+```bash
+API_GMV() { curl ... || echo "ERR"; }        # 失败时返回字符串 ERR
+[[ "$api" != "$b_api" ]] && hit_api=$el      # 只要"不等于基线"就算命中
+```
+
+于是接口返回 500 时 `api="ERR"`、基线是 `"110.00"`，两者不等 → 立刻记成「大屏可见 306 ms」。**实测把服务停掉、或让它从基线之后开始返回 500，脚本照样打印漂亮的毫秒数，而且 `exit 0`。**
+
+现在的做法：`curl -f`（HTTP≥400 即失败）、Doris 输出按 `^[0-9.]+\|[0-9.]+\|[0-9.]+$` 校验格式，失败一律**不参与命中判定**，连续 3 次失败直接判 FAIL。
 
 `--clean` 必须同时清 Doris 侧：07 作业是纯 `INSERT`（upsert）语义，源端删除**不会**让已聚合的行消失 —— 流式聚合没有 retract 传到 Doris 的路径。
 

@@ -379,8 +379,11 @@ function healthPanel(el, metrics) {
     { k: 'pipeline_freshness_s', label: '管道新鲜度', unit: 's', d: 0 },
   ].map((c) => {
     const m = by[c.k];
+    // title 用 threshold_desc：像「端到端延迟 3849ms」其实是 P3 的单次采样，
+    // 不是 P99，这句话只在库里、页面上看不到，容易被当成实时值。
+    const tip = m?.desc ? esc(m.desc) : '';
     return `
-<div style="padding:10px 12px;border-radius:8px;background:rgba(255,255,255,.022);
+<div title="${tip}" style="padding:10px 12px;border-radius:8px;background:rgba(255,255,255,.022);
             border:1px solid rgba(255,255,255,.035)">
   <div style="font-size:10.5px;color:#5A6B7A;letter-spacing:.4px">${c.label}</div>
   <div style="margin-top:5px;display:flex;align-items:baseline;gap:4px">
@@ -405,12 +408,15 @@ function healthPanel(el, metrics) {
 
   // 三条链路：从源到仓到应用，灯色取对应环节最差的那个指标
   const jobs = by['flink_jobs_running'];
-  const lag = by['kafka_lag'];
   const ckpt = by['checkpoint_p95_ms'];
+  const fresh = by['pipeline_freshness_s'];
   const chain = [
     { name: 'MySQL binlog → Flink CDC', ok: (jobs?.value || 0) >= 4 },
     { name: 'Flink → Doris 两阶段提交', ok: (ckpt?.value || 0) > 0 && (ckpt?.value || 0) < 30000 },
-    { name: 'Doris DWD → ADS 物化刷新', ok: (lag?.value || 0) < 1000 },
+    // 这里原来判的是 kafka_lag —— 那是「Kafka 还有多少条没消费」，
+    // 与 Doris 侧的物化刷新完全无关：Kafka 追平了它绿，刷新停了它也绿。
+    // 改用管道新鲜度（三张主表最近一次成功写入距今），它对得上灯名。
+    { name: 'Doris 写入 → 大屏可见', ok: (fresh?.value || 0) < 300 },
   ].map((c) => `
 <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;
             border-bottom:1px solid rgba(255,255,255,.03)">

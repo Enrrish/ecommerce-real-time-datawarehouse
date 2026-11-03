@@ -177,12 +177,16 @@ CREATE TABLE sink_dws_traffic_funnel_1h (
   'sink.buffer-size'       = '1048576',
   'sink.buffer-count'      = '32',
   'sink.buffer-flush.max-bytes' = '10485760',
-  -- 时间触发（P7 加）：上面的 max-bytes 是 10MB，这两张日/小时汇总表一天才几 KB，
-  -- 永远够不到阈值，于是只能等 checkpoint（10s）才落库 —— 大屏上的表现就是
-  -- 「埋点发出去了，要十几秒数字才动」。改成 1s 后 DWS 落库延迟从最坏 10s 压到 1s。
-  -- 代价是每秒一次 Stream Load，Doris 侧版本变多、compaction 压力上升；
-  -- 演示环境可接受，生产该按实际 QPS 重新权衡。
-  'sink.buffer-flush.interval'  = '1s',
+  -- 时间触发：上面的 max-bytes 是 10MB，这两张汇总表一天才几 KB，永远够不到
+  -- 阈值，只能等 checkpoint（10s）才落库 —— 大屏上的表现就是「埋点发出去了，
+  -- 要十几秒数字才动」。
+  --
+  -- 曾经设成 1s，注释里还写着「compaction 压力上升，演示环境可接受」。
+  -- 实测这个判断是错的：埋点连跑 3 小时后本表单 tablet 积压 6,276 个版本
+  -- （三张表里最多），BE 内存顶到 2.25 GB 上限后 compaction 从 08:19 起停摆，
+  -- 连 `COUNT(*) GROUP BY` 都要 28 秒 —— 实时性换来的是一张读不动的表。
+  -- 改回 10s（与 checkpoint 间隔一致），版本速率降一个数量级。
+  'sink.buffer-flush.interval'  = '10s',
   'sink.write-mode'        = 'STREAM_LOAD_BATCH'
 );
 
@@ -211,12 +215,16 @@ CREATE TABLE sink_dws_payment_method_1d (
   'sink.buffer-size'       = '1048576',
   'sink.buffer-count'      = '32',
   'sink.buffer-flush.max-bytes' = '10485760',
-  -- 时间触发（P7 加）：上面的 max-bytes 是 10MB，这两张日/小时汇总表一天才几 KB，
-  -- 永远够不到阈值，于是只能等 checkpoint（10s）才落库 —— 大屏上的表现就是
-  -- 「埋点发出去了，要十几秒数字才动」。改成 1s 后 DWS 落库延迟从最坏 10s 压到 1s。
-  -- 代价是每秒一次 Stream Load，Doris 侧版本变多、compaction 压力上升；
-  -- 演示环境可接受，生产该按实际 QPS 重新权衡。
-  'sink.buffer-flush.interval'  = '1s',
+  -- 时间触发：上面的 max-bytes 是 10MB，这两张汇总表一天才几 KB，永远够不到
+  -- 阈值，只能等 checkpoint（10s）才落库 —— 大屏上的表现就是「埋点发出去了，
+  -- 要十几秒数字才动」。
+  --
+  -- 曾经设成 1s，注释里还写着「compaction 压力上升，演示环境可接受」。
+  -- 实测这个判断是错的：埋点连跑 3 小时后本表单 tablet 积压 6,276 个版本
+  -- （三张表里最多），BE 内存顶到 2.25 GB 上限后 compaction 从 08:19 起停摆，
+  -- 连 `COUNT(*) GROUP BY` 都要 28 秒 —— 实时性换来的是一张读不动的表。
+  -- 改回 10s（与 checkpoint 间隔一致），版本速率降一个数量级。
+  'sink.buffer-flush.interval'  = '10s',
   'sink.write-mode'        = 'STREAM_LOAD_BATCH'
 );
 

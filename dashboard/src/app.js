@@ -159,8 +159,14 @@ function startTick() {
 async function pull() {
   const my = ++seq;
   startTick();
+  // 8 秒硬超时。后端已给 Doris 设 query_timeout=5s，正常一轮约 0.3s；
+  // 8 秒还拿不到说明管道假死（Doris 进程僵住 / 容器正在重启）。
+  // 不 abort 的话 fetch 会永远 pending，下面的 finally 也就永远不执行 ——
+  // 轮询彻底停摆，页面冻结在最后一个数字上，看起来像"还活着"。
+  const ctrl = new AbortController();
+  const killer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const res = await fetch('/api/dashboard', { cache: 'no-store' });
+    const res = await fetch('/api/dashboard', { cache: 'no-store', signal: ctrl.signal });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     if (my !== seq) return;                 // 有更新的请求在跑，丢弃这次结果
@@ -172,8 +178,11 @@ async function pull() {
     failStreak += 1;
     setLink(failStreak >= 3 ? 'bad' : 'warn',
       failStreak >= 3 ? '连接中断，重试中' : '数据延迟');
-    if (failStreak === 1) console.warn('[dashboard]', err.message);
+    if (failStreak === 1) {
+      console.warn('[dashboard]', err.name === 'AbortError' ? '请求超过 8s 未返回' : err.message);
+    }
   } finally {
+    clearTimeout(killer);
     if (!ONCE) setTimeout(pull, REFRESH_MS);
   }
 }

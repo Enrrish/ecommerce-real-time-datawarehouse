@@ -419,6 +419,9 @@ def collect(doris: Doris, meta_cache: dict) -> dict:
             "unit": r[3],
             "level": r[4],
             "group": r[5],
+            # 阈值说明必须传出去：像 e2e_latency_ms 这种「单次实测值当常量用」的
+            # 指标，只有这一句能说清它不是 P99。前端拿它做 title 提示。
+            "desc": r[6] if len(r) > 6 else "",
         })
 
     return {

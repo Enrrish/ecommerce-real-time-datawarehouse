@@ -96,9 +96,15 @@ CREATE TABLE sink_ods_user_event (
   'sink.properties.format' = 'json',
   'sink.properties.read_json_by_line' = 'true',
   'sink.enable-delete' = 'true',
-  -- 时间触发（P7 加）：不设这一项时 sink 只在 checkpoint（10s）落库，
+  -- 时间触发：不设这一项时 sink 只在 checkpoint（10s）落库，
   -- 「发一条埋点，13 秒后才在 ODS 里查到」—— 演示时很难解释。
-  'sink.buffer-flush.interval' = '1s'
+  --
+  -- 但不能设成 1s。Doris 每收一次 Stream Load 就生成一个数据版本，1 秒一次
+  -- 等于每秒一个版本。实测埋点连跑 3 小时后单 tablet 积压 4,434 个版本，
+  -- compaction 在 2.25 GB 内存上限下追不上（08:19 之后完全停摆），
+  -- 一条 `COUNT(*) GROUP BY dt, event_type` 要跑 28 秒 —— 7.7 万行的表读不动。
+  -- 10s 与 Flink 默认 checkpoint 间隔一致，版本产生速率降一个数量级。
+  'sink.buffer-flush.interval' = '10s'
 );
 
 INSERT INTO sink_ods_user_event
