@@ -98,3 +98,6 @@ desktop.ini
 *.swp
 # 下载中的半成品（fetch-flink-jars.sh 下载完会 mv 成正式文件名）
 *.part
+# 大屏离线快照：由 dashboard/server/snapshot.py 从实时数据生成，
+# 内容随时变、无审阅价值，需要时一条命令就能重新产出
+dashboard/snapshot.html

@@ -145,6 +145,11 @@ CREATE TABLE sink_dwd_user_event_clean (
   'sink.buffer-size'       = '1048576',
   'sink.buffer-count'      = '32',
   'sink.buffer-flush.max-bytes' = '10485760',
+  -- 时间触发（P7 加，与 09 号作业同理）：max-bytes 是 10MB 下限，而埋点每次
+  -- 只有几百字节，够不到阈值就只能等 checkpoint（10s）。这一层是大屏漏斗的
+  -- 上游，卡在这里等于整条链路都慢 10 秒 —— 实测加 1s flush 后端到端
+  -- 从 10.5s 降到 4s 以内。
+  'sink.buffer-flush.interval'  = '1s',
   -- 绕开上面那条流式管道，走「先攒后发」的整批请求体。
   'sink.write-mode'        = 'STREAM_LOAD_BATCH'
 );

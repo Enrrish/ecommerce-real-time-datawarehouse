@@ -177,6 +177,12 @@ CREATE TABLE sink_dws_traffic_funnel_1h (
   'sink.buffer-size'       = '1048576',
   'sink.buffer-count'      = '32',
   'sink.buffer-flush.max-bytes' = '10485760',
+  -- 时间触发（P7 加）：上面的 max-bytes 是 10MB，这两张日/小时汇总表一天才几 KB，
+  -- 永远够不到阈值，于是只能等 checkpoint（10s）才落库 —— 大屏上的表现就是
+  -- 「埋点发出去了，要十几秒数字才动」。改成 1s 后 DWS 落库延迟从最坏 10s 压到 1s。
+  -- 代价是每秒一次 Stream Load，Doris 侧版本变多、compaction 压力上升；
+  -- 演示环境可接受，生产该按实际 QPS 重新权衡。
+  'sink.buffer-flush.interval'  = '1s',
   'sink.write-mode'        = 'STREAM_LOAD_BATCH'
 );
 
@@ -205,6 +211,12 @@ CREATE TABLE sink_dws_payment_method_1d (
   'sink.buffer-size'       = '1048576',
   'sink.buffer-count'      = '32',
   'sink.buffer-flush.max-bytes' = '10485760',
+  -- 时间触发（P7 加）：上面的 max-bytes 是 10MB，这两张日/小时汇总表一天才几 KB，
+  -- 永远够不到阈值，于是只能等 checkpoint（10s）才落库 —— 大屏上的表现就是
+  -- 「埋点发出去了，要十几秒数字才动」。改成 1s 后 DWS 落库延迟从最坏 10s 压到 1s。
+  -- 代价是每秒一次 Stream Load，Doris 侧版本变多、compaction 压力上升；
+  -- 演示环境可接受，生产该按实际 QPS 重新权衡。
+  'sink.buffer-flush.interval'  = '1s',
   'sink.write-mode'        = 'STREAM_LOAD_BATCH'
 );
 

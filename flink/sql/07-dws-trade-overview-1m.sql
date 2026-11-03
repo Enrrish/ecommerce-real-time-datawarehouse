@@ -5,6 +5,14 @@
 -- 目标：realtime_dw.dws_trade_overview_1m
 -- server-id：5561-5576（ODS 5401-5484，P4 DWD 5531-5558，本作业 5561 起）
 --
+-- scan.startup.mode = 'latest-offset'（P7 起）：
+--   本作业是唯一保留的 mysql-cdc 直读作业（ODS 那 9 个已停，见 docs/04）。
+--   首次从零搭建时历史数据靠它做 initial 快照，但**重启**时没必要重放
+--   155 万行 —— 一是慢几分钟，二是聚合状态要从零重建，4 slot / 217MB
+--   的 taskHeap 扛不住。改成 latest-offset 后重启即秒起，历史行原地保留
+--   （目标表是 UNIQUE KEY 模型，不写就不会丢）。
+--   若需重建全量：把 4 处都改回 'initial' 再提交。
+--
 -- =============================================================================
 -- 为什么一个作业只做一张 DWS 表（这是实测撞出来的，不是设计偏好）
 -- =============================================================================
@@ -80,7 +88,8 @@ CREATE TABLE src_orders (
   'table-name'                   = 'orders',
   'server-id'                    = '5561-5564',
   'server-time-zone'             = 'Asia/Shanghai',
-  'scan.incremental.snapshot.chunk.size' = '200000'
+  'scan.incremental.snapshot.chunk.size' = '200000',
+  'scan.startup.mode' = 'latest-offset'
 );
 
 
@@ -103,7 +112,8 @@ CREATE TABLE src_order_items (
   'table-name'                   = 'order_items',
   'server-id'                    = '5565-5568',
   'server-time-zone'             = 'Asia/Shanghai',
-  'scan.incremental.snapshot.chunk.size' = '200000'
+  'scan.incremental.snapshot.chunk.size' = '200000',
+  'scan.startup.mode' = 'latest-offset'
 );
 
 
@@ -124,7 +134,8 @@ CREATE TABLE src_customers (
   'table-name'                   = 'customers',
   'server-id'                    = '5569-5572',
   'server-time-zone'             = 'Asia/Shanghai',
-  'scan.incremental.snapshot.chunk.size' = '200000'
+  'scan.incremental.snapshot.chunk.size' = '200000',
+  'scan.startup.mode' = 'latest-offset'
 );
 
 
@@ -146,7 +157,8 @@ CREATE TABLE src_order_payments (
   'table-name'                   = 'order_payments',
   'server-id'                    = '5573-5576',
   'server-time-zone'             = 'Asia/Shanghai',
-  'scan.incremental.snapshot.chunk.size' = '200000'
+  'scan.incremental.snapshot.chunk.size' = '200000',
+  'scan.startup.mode' = 'latest-offset'
 );
 
 
@@ -199,6 +211,10 @@ CREATE TABLE sink_dws_trade_overview_1m (
   'sink.buffer-size'       = '1048576',
   'sink.buffer-count'      = '32',
   'sink.buffer-flush.max-bytes' = '10485760',
+  -- 时间触发（P7 加）：max-bytes 的 10MB 是 connector 允许的下限，而盘点一次
+  -- 变更只产生几百字节，够不到阈值就只能等 checkpoint —— 实测 MySQL 写入到
+  -- DWS 可见 7.5s，加 1s 时间触发后降到 1s 级。
+  'sink.buffer-flush.interval'  = '1s',
   -- 环放大只缓解不根治，STREAM_LOAD_BATCH 走「先攒后发」的整批请求体才绕开。
   'sink.write-mode'        = 'STREAM_LOAD_BATCH'
 );

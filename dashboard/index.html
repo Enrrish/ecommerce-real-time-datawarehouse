@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OLIST 实时经营指挥台</title>
+<link rel="stylesheet" href="src/theme.css">
+</head>
+<body>
+
+<div id="screen">
+
+  <!-- ------------------------------------------------------------- 顶栏 -->
+  <header>
+    <div class="brand">
+      <span class="brand-mark">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+          <rect x="1" y="7"  width="2.6" height="6"  rx="1" fill="#35D6E8"/>
+          <rect x="5.7" y="4" width="2.6" height="9"  rx="1" fill="#35D6E8" opacity=".75"/>
+          <rect x="10.4" y="1" width="2.6" height="12" rx="1" fill="#35D6E8" opacity=".5"/>
+        </svg>
+      </span>
+      <div>
+        <div class="brand-title">OLIST 实时经营指挥台</div>
+        <div class="brand-sub">Real-Time Commerce Ops · Kafka + Flink CDC + Doris + ADS</div>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <span class="pill" id="linkPill"><i class="dot"></i><span id="linkText">链路正常</span></span>
+      <span class="pill live" id="todayPill" title="今日实时（改一行 MySQL 5 秒内会在这里变）">
+        <i class="dot"></i>今日 <b id="todayGmv">—</b>
+        <span class="sep">·</span><span id="todayOrders">—</span> 单
+      </span>
+      <span class="pill" id="datePill">数据日 —</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:#4C5B69;letter-spacing:.4px">刷新倒计时</span>
+        <div class="tick"><i id="tickBar"></i></div>
+      </div>
+      <span class="clock" id="clock">--:--:--</span>
+    </div>
+  </header>
+
+  <!-- ---------------------------------------------------------- KPI 条 -->
+  <section class="kpi-row" id="kpiRow"></section>
+
+  <!-- --------------------------------------------------------- 第二行 -->
+  <section class="row-a">
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">实时转化漏斗</span>
+        <span class="panel-note" id="funnelNote">昨日数据</span>
+      </div>
+      <div class="panel-body" id="pFunnel"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">成交趋势</span>
+        <span class="panel-note">
+          累计 GMV ·
+          <span style="color:#35D6E8">■</span> 当日
+          <span style="color:#5A6B7A;margin-left:8px">┄ 前一日</span>
+        </span>
+      </div>
+      <div class="panel-body" id="pTrend"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">品类 GMV TOP 6</span>
+        <span class="panel-note" id="catNote">全渠道</span>
+      </div>
+      <div class="panel-body" id="pCategory"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">地域分布</span>
+        <span class="panel-note" id="mapNote">巴西 27 州</span>
+      </div>
+      <div class="panel-body" id="pMap" style="position:relative"><div class="empty">加载中…</div></div>
+    </div>
+  </section>
+
+  <!-- --------------------------------------------------------- 第三行 -->
+  <section class="row-b">
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">支付方式分布</span>
+        <span class="panel-note">按支付笔数</span>
+      </div>
+      <div class="panel-body" id="pPayment"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">实时订单流水</span>
+        <span class="panel-note" style="display:flex;align-items:center;gap:6px">
+          <i style="width:6px;height:6px;border-radius:50%;background:#FF6A55;
+                    box-shadow:0 0 8px #FF6A55"></i>LIVE · 最近 8 笔
+        </span>
+      </div>
+      <div class="panel-body" id="pOrders"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">设备链路健康度</span>
+        <span class="panel-note" id="healthNote">Flink + Kafka + Doris 实测</span>
+      </div>
+      <div class="panel-body" id="pHealth"><div class="empty">加载中…</div></div>
+    </div>
+  </section>
+
+</div>
+
+<script src="src/charts.js"></script>
+<script src="src/app.js"></script>
+</body>
+</html>

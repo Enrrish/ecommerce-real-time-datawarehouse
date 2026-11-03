@@ -95,7 +95,10 @@ CREATE TABLE sink_ods_user_event (
   'sink.label-prefix' = 'ods_user_event',
   'sink.properties.format' = 'json',
   'sink.properties.read_json_by_line' = 'true',
-  'sink.enable-delete' = 'true'
+  'sink.enable-delete' = 'true',
+  -- 时间触发（P7 加）：不设这一项时 sink 只在 checkpoint（10s）落库，
+  -- 「发一条埋点，13 秒后才在 ODS 里查到」—— 演示时很难解释。
+  'sink.buffer-flush.interval' = '1s'
 );
 
 INSERT INTO sink_ods_user_event

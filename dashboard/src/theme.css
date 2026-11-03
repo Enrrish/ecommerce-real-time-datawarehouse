@@ -1,0 +1,338 @@
+/* =============================================================================
+   theme.css —— 大屏的色板、栅格与基础排版
+   -----------------------------------------------------------------------------
+   零外部依赖：没有 webfont、没有 CSS 框架、没有图标库。项目要求在离线环境
+   （面试现场不保证网络）一条 `python server/app.py` 就能跑起来，任何 CDN
+   引用都会变成白屏风险。字体走系统栈，图标全部内联 SVG。
+   ============================================================================= */
+
+:root {
+  /* 色板取自设计稿 docs/assets/dashboard.png */
+  --bg:          #080B10;
+  --panel:       #0F151C;
+  --panel-2:     #121A22;
+  --line:        rgba(53, 214, 232, 0.10);
+  --line-soft:   rgba(255, 255, 255, 0.045);
+
+  --text:        #E8F0F5;
+  --text-dim:    #7C8D9B;
+  --text-faint:  #4C5B69;
+
+  --accent:      #35D6E8;
+  --accent-dim:  rgba(53, 214, 232, 0.16);
+  --accent-soft: rgba(53, 214, 232, 0.06);
+
+  /* 中国习惯：涨红跌绿。设计稿里「↑12.4%」是暖色、「↓0.3s」是冷色，一致 */
+  --up:          #FF6A55;
+  --down:        #2FD07A;
+  --warn:        #FFB020;
+  --error:       #FF4D4F;
+
+  --radius:      10px;
+  --gap:         14px;
+
+  --font: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  overflow: hidden;
+  /* 大屏常年挂着，禁掉文本选中免得拖动时选中一片 */
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 1920×1080 的固定画布，按视口等比缩放居中。
+   用 transform 而不是 rem/vw：设计稿是按像素画的，缩放整块画布最不容易失真。 */
+#screen {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1920px;
+  height: 1080px;
+  transform-origin: center center;
+  display: grid;
+  grid-template-rows: 52px 126px 1fr 1fr;
+  gap: var(--gap);
+  padding: 18px 20px;
+  background:
+    radial-gradient(1200px 600px at 12% -10%, rgba(53, 214, 232, 0.055), transparent 60%),
+    radial-gradient(900px 500px at 92% 110%, rgba(255, 106, 85, 0.035), transparent 60%),
+    var(--bg);
+}
+
+/* ---------------------------------------------------------------- 顶栏 */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+
+.brand-mark {
+  width: 26px; height: 26px;
+  display: grid; place-items: center;
+  border-radius: 6px;
+  background: linear-gradient(145deg, rgba(53, 214, 232, 0.22), rgba(53, 214, 232, 0.04));
+  border: 1px solid rgba(53, 214, 232, 0.35);
+}
+
+.brand-title {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 2.5px;
+}
+
+.brand-sub {
+  font-size: 10.5px;
+  letter-spacing: 1.6px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+.header-right { display: flex; align-items: center; gap: 18px; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 13px;
+  font-size: 12px;
+  letter-spacing: 0.4px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.pill .dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--down);
+  box-shadow: 0 0 0 3px rgba(47, 208, 122, 0.14);
+}
+
+.pill.warn { color: var(--warn); border-color: rgba(255, 176, 32, 0.3); }
+.pill.warn .dot { background: var(--warn); box-shadow: 0 0 0 3px rgba(255, 176, 32, 0.14); }
+.pill.bad  { color: var(--error); border-color: rgba(255, 77, 79, 0.3); }
+.pill.bad .dot { background: var(--error); box-shadow: 0 0 0 3px rgba(255, 77, 79, 0.16); }
+
+/* 今日实时：顶栏上唯一会「跳动」的读数。
+   大屏主体是 2017-11-24 的历史复盘（分钟覆盖最全的一天），而这条是现在。
+   两个时间轴并排放，是为了让「实时」这个词有可验证的落点 —— 改一行 MySQL，
+   变的是这里，不是左边的历史 KPI。 */
+.pill.live {
+  color: var(--accent);
+  border-color: rgba(53, 214, 232, 0.32);
+  background: rgba(53, 214, 232, 0.06);
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.pill.live .dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(53, 214, 232, 0.14);
+  animation: livePulse 1.8s ease-in-out infinite;
+}
+.pill.live b { font-weight: 600; letter-spacing: 0.2px; }
+.pill.live .sep { color: #3A4753; }
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* 刷新倒计时：一条从右往左收的细线，比数字更直观 */
+.tick {
+  width: 74px; height: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.tick > i {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(90deg, var(--accent), rgba(53, 214, 232, 0.35));
+  transform-origin: left center;
+}
+
+.clock {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------- KPI 卡片 */
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: var(--gap);
+}
+
+.kpi {
+  position: relative;
+  padding: 15px 16px;
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid var(--line-soft);
+  overflow: hidden;
+}
+
+/* 左侧一道高光竖线，六张卡统一，成本极低但能立刻区分「卡片」与「背景」 */
+.kpi::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 18%;
+  width: 2px; height: 64%;
+  background: linear-gradient(180deg, transparent, var(--accent), transparent);
+  opacity: 0.55;
+}
+
+.kpi-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  letter-spacing: 0.6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kpi-value {
+  margin-top: 9px;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+  transition: color 0.25s ease;
+}
+
+.kpi-value .unit {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-dim);
+  margin-left: 5px;
+  letter-spacing: 0;
+}
+
+.kpi-foot {
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.delta { font-weight: 500; font-variant-numeric: tabular-nums; }
+.delta.up   { color: var(--up); }
+.delta.down { color: var(--down); }
+.delta.flat { color: var(--text-faint); }
+
+/* ------------------------------------------------------------- 面板通用 */
+.panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 16px 12px;
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(18, 26, 34, 0.92), rgba(15, 21, 28, 0.96));
+  border: 1px solid var(--line-soft);
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex: 0 0 auto;
+  margin-bottom: 6px;
+}
+
+.panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-title::before {
+  content: "";
+  width: 3px; height: 13px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(53, 214, 232, 0.6);
+}
+
+.panel-note {
+  font-size: 11px;
+  color: var(--text-faint);
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.panel-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* 双行：漏斗 / 趋势 / 品类 / 地图 */
+.row-a { display: grid; grid-template-columns: 352fr 636fr 372fr 420fr; gap: var(--gap); }
+/* 三行：支付 / 流水 / 健康度；列宽与上排刻意对齐（漏斗↔支付、趋势↔流水） */
+.row-b { display: grid; grid-template-columns: 352fr 636fr 832fr; gap: var(--gap); }
+
+/* --------------------------------------------------------------- 通用件 */
+.empty {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  letter-spacing: 0.5px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.legend i {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+/* 数字滚动时的呼吸感：只在值变化时由 JS 加 class，0.9s 后自动褪去 */
+@keyframes flash {
+  0%   { color: var(--accent); text-shadow: 0 0 14px rgba(53, 214, 232, 0.55); }
+  100% { color: inherit;      text-shadow: none; }
+}
+.flash { animation: flash 0.9s ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
