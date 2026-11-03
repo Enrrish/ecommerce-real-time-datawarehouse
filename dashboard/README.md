@@ -12,9 +12,17 @@
 | 实时转化漏斗 | 商详 → 加购 → 提交 → 支付 | `ads_funnel_1d` |
 | 成交趋势 | 分钟级 GMV 曲线 + 昨日同期对比 | `ads_realtime_overview` |
 | 品类排行 | GMV TOP 6 | `ads_category_rank_1d` |
+| 地域地图 | 巴西各州 GMV 占比填色 | `ads_region_map_1d` |
 | 支付方式 | 环形图 + 占比 | `ads_payment_method_1d` |
 | 实时订单流水 | 最近 7 笔订单滚动 | `ads_order_stream` |
-| 链路健康度 | Kafka 积压 / Checkpoint / 反写吞吐 / 反压 / 节点状态 | Flink & Doris 监控指标 |
+| 链路健康度 | Kafka 积压 / Checkpoint / 反写吞吐 / 反压 / 节点状态 | `ads_pipeline_health` |
+
+> **取数注意**：`ads_*` 的 `dt` 是业务日期（2016-09 ~ 2018-09），不是今天。
+> 时间条件一律用 `dt = (SELECT MAX(dt) FROM ...)` 定位最新分区，不要用 `CURRENT_DATE`
+> —— 数据是历史回放，按今天查会得到 0 行。
+>
+> **地图填色用 `gmv_ratio` 不用 `gmv`**：各州差两个数量级（SP 32%、RR 0.01%），
+> 用绝对金额只有 SP 一州发红。
 
 ## 技术选型
 

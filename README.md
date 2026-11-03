@@ -52,16 +52,18 @@ flowchart LR
     FLINK --> ODS
     FLINK --> DWD
     FLINK --> DWS
-    FLINK --> ADS
     ODS -. 下游作业读取 .-> DWD
     DWD -. 下游作业读取 .-> DWS
-    DWS -. 下游作业读取 .-> ADS
+    DWS -. SQL 全量刷新 .-> ADS
     ADS --> DASH
 ```
 
-> 实线 = Flink SQL 写入；虚线 = 下游作业读出上游表再加工。**四层都是 Flink 算完写进 Doris 的，
-> Doris 内部不做层间加工**（没有物化视图链、没有定时调度）。这一点决定了「改一行 MySQL 到
-> 大屏变化」只需一条流，不依赖任何离线任务。
+> 实线 = Flink SQL 写入；虚线 = 读出上游表再加工。**ODS / DWD / DWS 三层是 Flink 算完写进
+> Doris 的，ADS 是唯一例外** —— 它在 Doris 内部用 `INSERT OVERWRITE` 从 DWS 全量刷新
+> （`sql/doris/08-ads-refresh.sql`），不起 Flink 作业。原因很实际：4 个 slot 已被常驻作业
+> 占满，而 ADS 是「整表可重建」的小表（最大 9.8 万行），全量刷比重建一条增量流简单得多。
+> 除此之外 Doris 不做层间加工（没有物化视图链、没有定时调度），所以「改一行 MySQL 到
+> 大屏变化」依然只需一条流，不依赖任何离线任务。
 
 ---
 
@@ -95,10 +97,10 @@ flowchart LR
 │   └── flink/lib/         # 四个 connector jar，由脚本下载（gitignore）
 ├── sql/
 │   ├── mysql/             # 业务库建表 01-schema + 验收 02-verify
-│   └── doris/             # ODS 建表 + 验收脚本（DWD 起后续补）
+│   └── doris/             # 四层建表 01/03/05/07 + 刷新 08 + 验收 02/06/09
 ├── flink/sql/             # Flink SQL 作业，按分层编号
 ├── scripts/               # 数据装载、埋点生成、jar 下载、作业提交
-├── dashboard/             # 实时大屏工程与导出图
+├── dashboard/             # 大屏设计稿；工程与接数在 P7 建（现只有 README）
 └── docs/                  # 架构、分层模型、指标口径、环境、路线图
 ```
 
@@ -134,9 +136,10 @@ flowchart LR
 - [x] MySQL 业务库建表与 Olist 数据装载（155 万行，九表 diff 全 0）
 - [x] Flink CDC 接入 ODS（9 张表全量 + 增量，端到端 3.8s）
 - [x] 埋点生成脚本与去重验证（3% 重复注入，唯一键吃干净）
-- [ ] DWD 明细层（交易宽表 / 行为清洗 / SCD2 维表）
-- [ ] DWS / ADS 分层作业
-- [ ] 脏数据注入与指标基线对照
+- [x] DWD 明细层（交易宽表 112,650 行 / 行为清洗 / SCD2 拉链维表）
+- [x] DWS 汇总层（分钟 · 小时 · 日共 6 张预聚合表，与 DWD 重算 diff 全 0）
+- [x] ADS 应用层（7 张表，Doris 侧全量刷新）
+- [x] 脏数据注入与指标基线对照（3,001 条 + 3% 重复 / 5% 乱序，三层都不被污染）
 - [ ] 大屏接入 ADS 实数据
 
 ---
@@ -150,7 +153,9 @@ flowchart LR
 - WSL2 上限锁 10GB，六个容器 limit 合计 **8.75GB**（明细见 [docs/04 §4](docs/04-环境搭建.md)）
 - 容器按 `source` / `compute` / `olap` 三组 profile 分批启动，避免 BE 与 TM 同时拉起触发 OOM Killer
 - Doris 单 BE、单副本（`replication_num=1`）、BE 内存上限 2.5G
-- Flink 单 TM / 10 slots，每个作业并行度 1（10 个作业占满），Checkpoint 10s 落本地文件系统
+- Flink 单 TM / **4 slots**，每个作业并行度 1（4 个常驻作业占满），Checkpoint 10s 落本地文件系统
+  - 不用 10 slots：TM 的 taskHeap 按 slot 数均分（868MB ÷ 10 = 87MB），六表 join 跑不动；
+    ÷ 4 = 217MB 才行。降 slot 数比加内存总量对症（见 `docs/04 §6`）
 
 ---
 
