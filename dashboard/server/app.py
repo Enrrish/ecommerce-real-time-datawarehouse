@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -127,20 +128,52 @@ def _run_sql_file(rel: str) -> None:
     env = dict(os.environ, MSYS_NO_PATHCONV="1")
     path = PROJECT / rel
     with open(path, "rb") as fh:
-        subprocess.run(
+        res = subprocess.run(
             ["docker", "exec", "-i", "rt-doris-fe", "mysql", "-uroot", "-P9030", "-h127.0.0.1"],
-            stdin=fh, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env, timeout=180,
+            stdin=fh, capture_output=True, env=env, timeout=180,
         )
+    if res.returncode != 0:
+        tail = res.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise RuntimeError(f"{rel} 退出码 {res.returncode}: {' / '.join(tail)}")
+
+
+def _bash_exe() -> str:
+    """Git Bash 的绝对路径。
+
+    为什么不能直接 spawn "bash"：Windows 的 PATH 里还有两个同名程序 ——
+    System32\\bash.exe（WSL 启动器）和 WindowsApps 里的应用别名。从 Python
+    里按裸名字调用时命中哪个是不确定的，命中 WSL 就是一句中文报错 + 退出码 1，
+    子进程根本没有跑到脚本。这个坑让健康度面板整整一天都在显示昨天的快照，
+    因为 subprocess.run 的返回码没人看。
+
+    固定走绝对路径；可用 BASH_EXE 覆盖。
+    """
+    bad = ("\\windows\\system32\\", "\\windowsapps\\", "\\wsl")
+    cand = [
+        os.environ.get("BASH_EXE", ""),
+        shutil.which("bash") or "",
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+    ]
+    for p in cand:
+        if p and Path(p).is_file() and not any(b in p.lower() for b in bad):
+            return p
+    raise RuntimeError("找不到 Git Bash；设 BASH_EXE 指向 bash.exe")
 
 
 def _run_health_collect() -> None:
     env = dict(os.environ, MSYS_NO_PATHCONV="1")
-    subprocess.run(
-        ["bash", "scripts/collect-pipeline-health.sh"],
-        cwd=str(PROJECT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env=env, timeout=120,
+    res = subprocess.run(
+        [_bash_exe(), str(PROJECT / "scripts" / "collect-pipeline-health.sh")],
+        cwd=str(PROJECT), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=env, timeout=120,
     )
+    if res.returncode != 0:
+        # 以前这里是 DEVNULL + 不检查返回码，脚本挂了也一声不响，
+        # 结果 ads_pipeline_health 停在旧快照上，面板「看着有数，其实是昨天的」。
+        tail = (res.stderr or res.stdout).strip().splitlines()[-3:]
+        raise RuntimeError(f"健康度采集退出码 {res.returncode}: {' / '.join(tail)}")
 
 
 def _loop(name: str, period: float, fn) -> None:

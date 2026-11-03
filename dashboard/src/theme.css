@@ -59,9 +59,15 @@ html, body {
   height: 1080px;
   transform-origin: center center;
   display: grid;
-  grid-template-rows: 52px 126px 1fr 1fr;
+  /* 两行必须写 minmax(0, 1fr)，不能写 1fr。
+     1fr 等于 minmax(auto, 1fr)，其中的 auto 最小值取的是内容的 min-content ——
+     图表按测量到的高度画，画出来的 SVG 又比容器高一点点，行就被内容撑大，
+     下一轮量到更高再画更高，页面会一轮一轮往下长。
+     实测就是这个循环：行高每 1.5 秒 +6px，十分钟后整屏溢出。 */
+  grid-template-rows: 52px 126px minmax(0, 1fr) minmax(0, 1fr);
   gap: var(--gap);
   padding: 18px 20px;
+  overflow: hidden;
   background:
     radial-gradient(1200px 600px at 12% -10%, rgba(53, 214, 232, 0.055), transparent 60%),
     radial-gradient(900px 500px at 92% 110%, rgba(255, 106, 85, 0.035), transparent 60%),
@@ -293,7 +299,14 @@ header {
   position: relative;
   flex: 1 1 auto;
   min-height: 0;
+  /* 图表是按 panel-body 的实时尺寸画的，万一某块内容比面板高，
+     宁可裁掉也不能让它把面板撑开 —— 撑开会连累整行，进而让下一轮量到更大的尺寸。 */
+  overflow: hidden;
 }
+
+/* SVG 默认是行内元素，底部会留出基线间隙（约 4~6px）。这点间隙足以让
+   「画满整个容器」的图表比容器高，触发栅格行反复增高。全部按块级渲染。 */
+.panel-body svg { display: block; }
 
 /* 双行：漏斗 / 趋势 / 品类 / 地图 */
 .row-a { display: grid; grid-template-columns: 352fr 636fr 372fr 420fr; gap: var(--gap); }

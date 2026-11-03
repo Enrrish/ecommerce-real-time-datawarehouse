@@ -31,6 +31,9 @@ gen_user_events.py —— 合成用户行为埋点日志，写 Kafka
   # 持续压测：每秒 30 条，跑 10 分钟
   python scripts/gen_user_events.py --rate 30 --duration 600
 
+  # 持续模式（大屏演示）：每 2 秒新开 3 个会话，事件按自然延迟到点才发
+  python scripts/gen_user_events.py --live 2 --sessions 3
+
   # 只打印到屏幕，不连 Kafka（用来肉眼检查字段）
   python scripts/gen_user_events.py --events 5 --sink stdout
 
@@ -48,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import json
 import random
 import statistics
@@ -192,7 +196,8 @@ def build_session(
     return events
 
 
-def generate(args) -> list[dict]:
+def load_source(args) -> tuple[list[str], dict[str, tuple[str, float]], list[str]]:
+    """读一遍实体字典。批量模式和持续模式都从这里拿，避免每轮重读 12 万行 CSV。"""
     root = Path(__file__).resolve().parent.parent
     src = Path(args.src) if args.src else root / "data" / "raw" / "olist"
 
@@ -202,6 +207,11 @@ def generate(args) -> list[dict]:
 
     products, meta = load_products(src)
     users = load_users(src)
+    return products, meta, users
+
+
+def generate(args, loaded=None) -> list[dict]:
+    products, meta, users = loaded or load_source(args)
     rng = random.Random(args.seed)
 
     now = datetime.now(TZ).replace(tzinfo=None)
@@ -283,12 +293,13 @@ def ensure_topic(bootstrap: str, topic: str, partitions: int) -> None:
         admin.close()
 
 
-def sink_kafka(events: list[dict], args) -> None:
+def make_producer(args):
+    """建一个连上 Kafka 的 producer。批量模式和持续模式共用，配置只写一份。"""
     from kafka import KafkaProducer
 
     ensure_topic(args.bootstrap, args.topic, args.partitions)
 
-    producer = KafkaProducer(
+    return KafkaProducer(
         bootstrap_servers=args.bootstrap,
         # 按 session_id 做 key：同一会话进同一分区，分区内保序。
         # 漏斗按 session 归因（docs/03 §2 归因规则）依赖这个顺序。
@@ -298,6 +309,10 @@ def sink_kafka(events: list[dict], args) -> None:
         linger_ms=20,          # 攒 20ms 再发，批量提升吞吐
         retries=3,
     )
+
+
+def sink_kafka(events: list[dict], args) -> None:
+    producer = make_producer(args)
 
     total = len(events)
     t0 = time.monotonic()
@@ -335,6 +350,71 @@ def same_time_guard(events: list[dict]) -> None:
         raise SystemExit(f"生成了 {len(future)} 条未来时间的事件，已中止（首条: {future[0]['event_time']}）")
 
 
+def live_loop(args, loaded) -> None:
+    """持续模式：像真人在用一样，事件到点才发。
+
+    批量模式是一次性回放 —— 先按 --window 把 event_time 铺在过去一段时间里，
+    再匀速灌进 Kafka，所以消息的时间戳天然落后于发送时刻。
+
+    持续模式反过来：每隔 --loop 秒新开 --sessions 个会话，会话里每个动作
+    按它自己的自然延迟（浏览停 4~35s，提交后又犹豫 30~240s）排队，到点才发。
+    这样每条消息的 event_time 与到达时间只差一个发送周期，大屏上的
+    「管道新鲜度」才是真的，而不是靠把时间戳往前拨造出来的假实时。
+
+    内存只跟「在途会话」有关：默认 3 会话/秒 × 最长 8.5 分钟 ≈ 1500 个会话、
+    几千条待发事件，可以一直跑。
+    """
+    products, meta, users = loaded
+    producer = make_producer(args)
+    rng = random.Random(args.seed)
+
+    pending: list[tuple[str, int, dict]] = []   # (event_time, 序号, 事件)
+    seq = 0
+    sent = 0
+    started = 0
+    t0 = time.monotonic()
+    last_report = 0.0
+
+    print(f"[live] 每 {args.live:g}s 新开 {args.sessions} 个会话，Ctrl-C 结束")
+    try:
+        while True:
+            tick = time.monotonic()
+            now = datetime.now(TZ).replace(tzinfo=None)
+            now_key = now.strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}"
+
+            # 1) 新会话：起点就是「此刻」，后续动作自然落在未来
+            for _ in range(args.sessions):
+                for ev in build_session(
+                    rng, now, users, products, meta,
+                    args.p_add, args.p_checkout, args.p_pay,
+                ):
+                    seq += 1
+                    heapq.heappush(pending, (ev["event_time"], seq, ev))
+                started += 1
+
+            # 2) 到点的发出去。时间戳是定长字符串，字典序即时间序
+            batch = 0
+            while pending and pending[0][0] <= now_key:
+                _, _, ev = heapq.heappop(pending)
+                producer.send(args.topic, key=ev["session_id"], value=ev)
+                sent += 1
+                batch += 1
+            if batch:
+                producer.flush()
+
+            if tick - last_report >= 10:
+                last_report = tick
+                print(f"[live] 已发 {sent} 条 / 在途 {len(pending)} 条 / "
+                      f"累计会话 {started} / 运行 {time.monotonic() - t0:.0f}s")
+
+            time.sleep(max(0.0, args.live - (time.monotonic() - tick)))
+    except KeyboardInterrupt:
+        print(f"\n[live] 停止：共发 {sent} 条，在途丢弃 {len(pending)} 条")
+    finally:
+        producer.flush()
+        producer.close()
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(description="合成 Olist 用户行为埋点并投递 Kafka")
@@ -358,7 +438,19 @@ def main() -> int:
     ap.add_argument("--p-pay", type=float, default=0.50, help="提交到支付的转化率")
     ap.add_argument("--seed", type=int, default=None, help="随机种子，便于复现")
     ap.add_argument("--src", default=None, help="原始 CSV 目录，默认 data/raw/olist")
+
+    # 持续模式（大屏演示用）：会话持续产生，事件按自然延迟到点才发
+    ap.add_argument("--live", type=float, default=0, metavar="SEC",
+                    help="持续模式：每 SEC 秒新开一批会话，事件到点才发。0 = 关闭（一次性批量）")
+    ap.add_argument("--sessions", type=int, default=3,
+                    help="持续模式每批新开几个会话（1 会话 ≈ 1.9 条事件）")
     args = ap.parse_args()
+
+    if args.live > 0:
+        if args.duration or args.rate:
+            ap.error("--live 与 --rate / --duration 互斥：持续模式自己按真实节奏发")
+        live_loop(args, load_source(args))
+        return 0
 
     if args.duration and args.rate <= 0:
         ap.error("--duration 需要配合 --rate > 0")

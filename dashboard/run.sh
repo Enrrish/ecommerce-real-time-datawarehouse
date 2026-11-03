@@ -4,6 +4,7 @@
 # -----------------------------------------------------------------------------
 # 用法：
 #   bash dashboard/run.sh                 # http://127.0.0.1:8080/（1.5 秒轮询）
+#   bash dashboard/run.sh --with-events   # 同时起持续埋点，漏斗会一直跳（演示用）
 #   bash dashboard/run.sh --port 9000
 #   bash dashboard/run.sh --snapshot      # 只导出单文件快照，不起服务
 #   bash dashboard/run.sh --no-refresh    # 只查询不刷新 ADS（排查用）
@@ -16,14 +17,17 @@ cd "$(dirname "$0")"
 
 PORT=8080
 MODE=serve
+FEED=0
 EXTRA=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --port)     PORT="$2"; shift 2 ;;
     --snapshot) MODE=snapshot; shift ;;
+    --with-events) FEED=1; shift ;;
     --no-refresh) EXTRA+=(--no-refresh); shift ;;
-    -h|--help)  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # 注意用 basename：上面已经 cd 到 dashboard/，$0 还是 "dashboard/run.sh" 就读不到了
+    -h|--help)  sed -n '2,13p' "$(basename "$0")" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)          EXTRA+=("$1"); shift ;;
   esac
 done
@@ -52,4 +56,16 @@ echo "   刷新   页面 1.5s · 今日 1s · 漏斗 2s · 健康度 15s · 全�
 echo "  Ctrl+C 停止"
 echo "=================================================================="
 
-PYTHONPATH=server exec python server/app.py --port "$PORT" "${EXTRA[@]}"
+# 持续埋点：不启动的话漏斗面板是静止的（历史事件的累计值）。
+# 大屏只显示「今天」的漏斗，没人产生事件，它当然不动。
+if [ "$FEED" = "1" ]; then
+  echo " 埋点   持续模式：每 2 秒新开 3 个会话（Ctrl+C 一起停）"
+  python ../scripts/gen_user_events.py --live 2 --sessions 3 &
+  FEED_PID=$!
+  trap 'kill "$FEED_PID" 2>/dev/null || true' EXIT INT TERM
+  PYTHONPATH=server python server/app.py --port "$PORT" "${EXTRA[@]}"
+else
+  echo " 提示   想看漏斗动起来，加 --with-events，或另开终端跑"
+  echo "        python scripts/gen_user_events.py --live 2 --sessions 3"
+  PYTHONPATH=server exec python server/app.py --port "$PORT" "${EXTRA[@]}"
+fi
