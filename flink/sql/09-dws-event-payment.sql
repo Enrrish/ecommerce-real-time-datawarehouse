@@ -75,7 +75,9 @@ CREATE TABLE src_user_event (
   'properties.group.id' = 'flink-dws-traffic-funnel',
   'scan.startup.mode' = 'earliest-offset',
   'format' = 'json',
-  'json.fail-on-missing-field' = 'false'
+  -- 解析失败整条丢弃 —— 与 04 / 06 一致，理由见 04 文件头第 3 条
+  'json.fail-on-missing-field' = 'false',
+  'json.ignore-parse-errors' = 'true'
 );
 
 
@@ -149,6 +151,9 @@ FROM (
     `event_id`, `evt_time`, `event_type`, `user_id`, `session_id`,
     ROW_NUMBER() OVER (PARTITION BY `event_id` ORDER BY `proc_time` ASC) AS `rn`
   FROM `src_user_event`
+  -- 没有 event_id 的消息在这里丢掉：ROW_NUMBER 只按 event_id 分组，NULL 会自成一组建出
+  -- 一条 dt/hour 全空的垃圾行。与 04 / 06 两层保持同一个口径（见 04 文件头第 4 条）。
+  WHERE `event_id` IS NOT NULL AND TRIM(`event_id`) <> ''
 ) t
 WHERE t.`rn` = 1;
 

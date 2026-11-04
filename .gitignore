@@ -101,3 +101,6 @@ desktop.ini
 # 大屏离线快照：由 dashboard/server/snapshot.py 从实时数据生成，
 # 内容随时变、无审阅价值，需要时一条命令就能重新产出
 dashboard/snapshot.html
+# 端到端延迟实测结果（check_lag.py 写、collect-pipeline-health.sh 读）。
+# 是本机某个时刻的测量值，不是代码，不该进版本库
+scripts/.latency.json

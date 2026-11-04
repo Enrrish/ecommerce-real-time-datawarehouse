@@ -65,7 +65,17 @@ CREATE TABLE IF NOT EXISTS `dwd_trade_order_detail` (
   `seller_state`                  VARCHAR(8)    COMMENT '卖家所在州',
 
   -- 支付维度（按订单聚合后的结果，不是流水明细）
-  `payment_type`                  VARCHAR(20)   COMMENT '金额最大的那笔的支付方式',
+  --
+  -- 这里**没有 payment_type 列**，是刻意的。初版 DDL 有过一列
+  -- `VARCHAR(20) COMMENT '金额最大的那笔的支付方式'`，作业从头到尾没写过它，
+  -- 于是那一列永远为 NULL。查下来不是漏写，是三个理由：
+  --   1. Flink 1.18 没有 MAX_BY，「金额最大的那笔」取不到；
+  --      退化用 MAX(payment_type) 是字典序最大，和金额无关，是假指标。
+  --   2. 支付方式是**订单级的一对多属性**（一单可以是信用卡 + 优惠券），
+  --      硬塞进订单行粒度的宽表，选哪个都是近似。
+  --   3. 真正需要支付方式占比的地方在 DWS：`dws_payment_method_1d`
+  --      直接从 ods_order_payments 聚合，那里是准确的（`sql/doris/05-dws.sql` §6）。
+  -- 留下一个恒 NULL 的列比少一列更糟 —— 下游会以为「有值只是没填」。
   `payment_total`                 DECIMAL(18,2) COMMENT '该订单支付总额，多笔求和',
   `payment_count`                 INT           COMMENT '该订单支付笔数，>1 表示分期或组合支付',
 

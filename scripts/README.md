@@ -1,16 +1,18 @@
 # scripts
 
-数据装载与埋点生成脚本。
+数据装载、埋点生成、一键启动与健康度采集脚本。
 
 ```
 scripts/
 ├── requirements.txt
+├── demo.sh               # 一键：起容器 → topic → 建表 → 回填 → 提作业 → 开大屏
 ├── prepare_load.py       # 原始 CSV → LOAD DATA 可读的 TSV
 ├── import.sh             # 一键：起 MySQL → 预处理 → 导入 → 验收
 ├── gen_user_events.py    # 合成埋点事件 → Kafka
 ├── fetch-flink-jars.sh   # 下载 4 个 connector jar（含 MySQL JDBC 驱动）
 ├── submit-sql.sh         # 提交 Flink SQL 作业并打印运行状态
-└── collect-pipeline-health.sh  # 采集链路健康度 → ads_pipeline_health（P6）
+├── collect-pipeline-health.sh  # 采集链路健康度 → ads_pipeline_health
+└── check_lag.py          # 端到端延迟真采样 → P50/P95/P99
 ```
 
 ## 依赖
@@ -191,6 +193,20 @@ bash scripts/collect-pipeline-health.sh --skip-kafka # 跳过 Kafka 抽样（约
 没有任何一个系统能单独算全。**监控必须旁路采集**，不能挂在被观测的主链路上：
 主链路挂了、指标也停了，那就永远发现不了挂。
 
+两个口径上的坑：
+
+**① `e2e_latency_ms` 不能是常量。** 它原来是 P3 手工测的一次 3,849ms，写死在脚本里 ——
+那不是测量，是引用测量，优化不动、劣化也不动。现在读 `scripts/.latency.json`
+（`check_lag.py --write` 落的实测 P99）；没有这个文件才退回历史基线，并且**在阈值
+说明里写清「这是基线不是 P99」**。阈值也跟着架构走：`<12000 ok`，因为 sink 的
+flush 间隔就是 10s。
+
+**② `checkpoint_p95_ms` 不能用 `summary`。** Flink 的 `/checkpoints` 有两个口径：
+`summary` 是**全生命周期**分布（从作业启动那天算起），`history` 是最近若干次。
+CDC 作业初始快照期间 checkpoint 会被拖到十几秒，这历史一旦进了 summary 就永远留着 ——
+实测一个已经平稳跑了几小时的作业仍然报 **19,095ms** 并常亮 critical。
+现在改成从 `history` 里取最近 10 次 COMPLETED 自己算 P95。
+
 **质量指标的口径是这张表最容易做错的地方。** `dup_rate` / `late_ratio` 用
 「最近 N 条滑动窗口 + 跨分区均分」，实测试了三次才对：
 
@@ -205,10 +221,59 @@ bash scripts/collect-pipeline-health.sh --skip-kafka # 跳过 Kafka 抽样（约
 
 ---
 
-## 待补充（P7）
+## `demo.sh`
 
-- [x] 乱序注入 —— 已内联到 `gen_user_events.py --late-rate`，没有单独建脚本
-      （重复事件由 `--dup-rate` 覆盖，两者共用同一批生成逻辑更省事）
-- [x] 健康度采集 —— `collect-pipeline-health.sh`
-- [ ] `check_lag.py`：端到端延迟 P99 采样（当前用 P3 的 3,849ms 单次实测作常量，
-      需要采 200 次以上才够报 P99，见 `docs/03 §5`）
+```bash
+bash scripts/demo.sh                  # 起集群 → 建表 → 回填 → 提作业 → 开大屏
+bash scripts/demo.sh --no-dashboard   # 只把后端跑起来
+bash scripts/demo.sh --with-events    # 同时起持续埋点（漏斗会一直动）
+bash scripts/demo.sh --import         # 业务库是空的，顺手调 import.sh
+```
+
+六步，顺序不能换：
+
+| 步 | 动作 | 换顺序的后果 |
+| --- | --- | --- |
+| 1 | 起六个容器（source → compute → olap 分批） | BE 与 TM 同时拉起会撞 WSL 的 OOM Killer |
+| 2 | 建 Kafka topic（3 分区） | 不建 Kafka 会自己建，但是 **1 分区**；漏斗会话归因与 dup/late 抽样的分区假设全部失效，且不报错 |
+| 3 | 确认业务库有 155 万行 | 空库提作业 = 快照 0 行，大屏全是空面板，看不出哪里错了 |
+| 4 | 建 Doris 库表（01 → 03 → 05 → 07） | 07 的刷新要读 05 建的表，跑反了不报错，只是刷出空表 |
+| 5 | 提作业：先两个一次性，再四个常驻 | 4 个 slot 装不下 6 个作业；一次性的跑完必须取消 |
+| 6 | 起大屏 | 前置没就绪时 `run.sh` 会直接报错退出，不会白屏 |
+
+幂等判据分别是：容器 `.State.Health` / topic 是否在 list 里 / `olist.orders` 行数 /
+`CREATE TABLE IF NOT EXISTS` / 作业名里是否含该 sink 表 / `dwd_trade_order_detail`
+与 `dws_trade_category_1d` 的行数。重复执行只补缺的部分。
+
+**为什么第 5 步要分两批**：`05-dwd-trade-order-detail`（订单宽表，112,650 行）和
+`08-dws-trade-daily`（品类/卖家/地域日粒度）是「跑一次就够」的历史快照，变更频率是天级。
+把它们和常驻作业一起提，4 个 slot 必然不够；所以「提上去 → 等行数到位 → cancel」，
+这个流程在脚本里是显式的，不是靠人记得。
+
+## `check_lag.py`
+
+端到端延迟真采样，输出 P50 / P95 / P99。
+
+```bash
+python scripts/check_lag.py              # 200 条探针，ODS + DWD 两条链路都测（约 2 分钟）
+python scripts/check_lag.py --samples 60 # 快速跑一轮
+python scripts/check_lag.py --chain ods  # 只测 Kafka → ODS
+python scripts/check_lag.py --write      # 把 P99 写回 ads_pipeline_health
+```
+
+做法：往 Kafka 打一条 `event_type=probe_latency` 的探针，轮询 Doris 直到它出现，
+`latency = 查到时刻 - 交给 producer 的时刻`。
+
+三个约束决定了它必须这么写：
+
+1. **不能往业务表插测试订单**。GMV 是累计口径，插一行就永久多一行（Doris 纯 upsert
+   没有 retract），减不掉。所以探针只能走埋点流。
+2. **探针不能污染指标**。`probe_latency` 不在 DWD 的 event_type 白名单里 →
+   `is_valid = 0` → 不进漏斗（DWS 带 `WHERE is_valid = 1`）。跑完还会删掉，
+   贴源层不留垃圾。
+3. **轮询不能用 `docker exec` 裸跑**。单次 826ms，比被测对象还慢。复用
+   `dashboard/server/doris.py` 的常驻管道（12~26ms/次）。
+
+已知偏差：轮询粒度 100ms（每个样本 +0~100ms）；sink 的 `buffer-flush.interval = 10s`
+是**架构下限**，所以 P99 在 10s 附近是正常的 —— 想压到秒级只能改 flush 间隔，
+而 1s 会把 Doris 版本打爆（见 `flink/sql/06` 的注释）。

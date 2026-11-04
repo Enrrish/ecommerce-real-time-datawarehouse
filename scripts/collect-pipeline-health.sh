@@ -17,13 +17,28 @@
 # 一个必须讲清楚的口径问题：事件年龄 ≠ 端到端延迟
 # =============================================================================
 # `event_age` = 入库时刻 - 事件业务时间，本脚本从 ods_user_event 的
-#   (ts_ms/1000 - UNIX_TIMESTAMP(event_time)) 算。
-# 实测 p50 是 65 小时 —— 因为埋点生成器刻意做了 1 小时回填，且数据是两天前的。
-# 拿它当"延迟"会得出"链路延迟 65 小时"的荒谬结论（docs/03 §5 已警告）。
+#   (ts_ms/1000 - UNIX_TIMESTAMP(event_time)) 算，**只看最近 10 分钟写入的行**。
 #
-# 真正的端到端延迟必须掐表：源端写一行，轮询目标表直到可见。P3 实测单次
-# 3,849 ms。脚本里用常量写入并标注来源，不在每次采集时重测 —— 重测要往业务
-# 表插测试订单，会污染 GMV；要干净就得单独建测试表，为一个大屏数字不值得。
+# 为什么必须加时间窗：这张表是累计的，全量口径被历史数据钉死过两次 ——
+# P7 重放整条 topic 时，几万条「几天前生成的事件」在当下被重写一遍，
+# 全量 P99 直接报到 4.7 天并长期常亮 critical，而链路其实完全正常。
+# 全量口径度量的是「这张表里最老的数据有多老」，不是「现在的数据有多旧」。
+#
+# 窗口取 10 分钟而不是 1 小时：重放本身也在最近一小时内，1 小时的窗口同样会
+# 把它算进去（实测还是 4.7 天）。10 分钟能过滤掉「一次性的历史回放」，
+# 又足够容纳正常速率下的样本量（持续埋点每 2 秒 3 个会话）。
+#
+# 它也不是延迟：生成器本身就有 1h 回填（docs/03 §5 已警告），所以这个值正常
+# 就在 0~3600 之间摆动，代表的是「生产者把多久以前的事补进来了」。
+#
+# 真正的端到端延迟必须掐表：源端写一行，轮询目标表直到可见。P3 手工测过一次
+# 3,849 ms，那个数字曾经被写死在这个脚本里当常量用 —— 这不是测量，是引用测量：
+# 优化了它不动，劣化了它也不动。
+#
+# 现在改由 `scripts/check_lag.py` 真采 200 条探针算 P99，结果落在
+# `scripts/.latency.json`，本脚本读它；读不到才退回 3,849 那个历史基线，
+# 并且**在阈值说明里明确写出「这是历史基线不是 P99」** —— 常量伪装成测量值
+# 是这类面板最容易骗人的地方。
 #
 # 所以健康度面板上是这样分组的：
 #   delay   组：e2e_latency（真实延迟，常量）+ pipeline_freshness（链路是否还活着）
@@ -64,13 +79,30 @@ level_of() {
 # 反向阈值（越小越好但超过才算坏，用于「越大越好」之外的场景暂不需要）
 
 echo "==> 采集 Doris 侧指标"
+# 事件年龄：**只看最近 1 小时写入的行**（ts_ms 是入库时刻）。
+#
+# 为什么必须加时间窗：这张表是累计的，全量 P99 会被历史数据永远钉住。
+# 实测两次都是同一个坑 —— 早期批量灌的 2 万条事件是几天前生成的，回放时
+# 入库时刻与事件时间差了 3.7 天、后来变成 4.7 天，于是 P99 一直报 critical，
+# 而实际上链路当下完全正常。全量口径度量的是「这张表里最老的数据有多老」，
+# 不是「现在的数据有多旧」。
+#
+# 窗口取 1 小时，与埋点生成器的 --window 3600 对齐：它会做 1 小时回填，
+# 所以正常情况下这个值就在 3600s 上下，波动代表的是生成器行为不是链路问题。
 EVENT_AGE_LINE=$(doris "
-  SELECT CAST(PERCENTILE(x,0.5) AS BIGINT), CAST(PERCENTILE(x,0.99) AS BIGINT)
-  FROM (SELECT ts_ms/1000 - UNIX_TIMESTAMP(event_time) AS x FROM ods_user_event) t;")
+  SELECT CAST(PERCENTILE(x,0.5) AS BIGINT), CAST(PERCENTILE(x,0.99) AS BIGINT), COUNT(*)
+  FROM (SELECT ts_ms/1000 - UNIX_TIMESTAMP(event_time) AS x FROM ods_user_event
+        WHERE ts_ms >= (UNIX_TIMESTAMP() - 600) * 1000) t;")
 EVENT_AGE_P50=$(num_or "$(echo "$EVENT_AGE_LINE" | cut -f1)" 0)
 EVENT_AGE_P99=$(num_or "$(echo "$EVENT_AGE_LINE" | cut -f2)" 0)
+EVENT_AGE_N=$(num_or "$(echo "$EVENT_AGE_LINE" | cut -f3)" 0)
 EVENT_AGE_P50=$(printf '%.0f' "$EVENT_AGE_P50")
 EVENT_AGE_P99=$(printf '%.0f' "$EVENT_AGE_P99")
+if [[ "${EVENT_AGE_N:-0}" -eq 0 ]]; then
+  EVENT_AGE_DESC='近 10 分钟没有任何写入（没有生产者在发事件）—— 0 不代表健康，看 pipeline_freshness。<1天 ok'
+else
+  EVENT_AGE_DESC="近 10 分钟写入的 $EVENT_AGE_N 条：**写入那一刻**数据已有多旧（不是延迟）。生成器有 1h 回填，正常在 0~3600s 摆动；持续天级说明生产者时钟或回放出了问题。<1天 ok / <3天 warn"
+fi
 
 # 管道新鲜度取三张主表的 update_time 里最新的那个 —— 只要有一条链还在写，
 # 就说明管道活着。只用一张表的话，某张表专门停掉（比如日粒度批表）会误报红。
@@ -101,17 +133,36 @@ CANCELED_ORDERS=$(num_or "$(doris "SELECT COUNT(DISTINCT order_id) FROM dwd_trad
                                WHERE order_status IN ('canceled','unavailable');")" 0)
 
 echo "==> 采集 Flink 侧指标"
-# checkpoint 耗时 P95：取运行中作业里最慢的那个 P95
-# 用 Flink 自己算好的 summary.end_to_end_duration.p95，而不是从 history 里手算 ——
-# /checkpoints 的 history 只保留最近若干条，手算样本量不稳定；summary 是全生命周期的，
-# 对长期运行作业会略微偏保守（含早期冷启动的慢 checkpoint），这个偏差方向是安全的。
+# checkpoint 耗时 P95：取运行中作业里最慢的那个 P95。
+#
+# 口径：**最近若干次已完成的 checkpoint**（Flink 的 history，默认保留 10 条），
+# 不是 summary 里的全生命周期 P95。
+#
+# 为什么不用 summary —— 实测踩过：summary 的 end_to_end_duration 是**从作业启动
+# 那天起**的累计分布，永不遗忘。CDC 作业初始快照期间（155 万行全量）checkpoint
+# 会被快照阶段拖到十几秒，这段历史一旦进了 summary 就永远留在那里，于是一个已经
+# 平稳跑了几小时的作业，P95 仍然报 19,095ms 并常亮 critical。
+# 那不是一个「当前状态」指标，是「这个作业历史上最难受的时候有多难受」。
+#
+# history 里每条 completed 记录的字段是 end_to_end_duration（毫秒）；个别版本
+# 只给 duration，两个都读一遍，读不到就退回 summary —— 宁可口径退化，不要报 0。
 CKPT_LINE=$(flink "/jobs/overview" | python -c "
 import sys, json, subprocess
 try:
     d = json.load(sys.stdin)
 except Exception:
     print('0\t0'); sys.exit(0)
-p95s, running = [], 0
+
+def p95(vals):
+    v = sorted(vals)
+    if not v:
+        return 0
+    pos = (len(v) - 1) * 0.95
+    lo = int(pos)
+    hi = min(lo + 1, len(v) - 1)
+    return int(v[lo] * (1 - (pos - lo)) + v[hi] * (pos - lo))
+
+p95s, running, recent = [], 0, 0
 for j in d.get('jobs', []):
     if j['state'] != 'RUNNING':
         continue
@@ -121,20 +172,36 @@ for j in d.get('jobs', []):
                             'http://localhost:8081/jobs/%s/checkpoints' % j['jid']],
                            capture_output=True, text=True, timeout=15)
         c = json.loads(r.stdout)
-        p = c.get('summary', {}).get('end_to_end_duration', {}).get('p95', 0) or 0
-        if p: p95s.append(p)
     except Exception:
-        pass
-print('%d\t%d' % (max(p95s) if p95s else 0, running))
-" 2>/dev/null || echo "0	0")
+        continue
+    hist = [e for e in (c.get('history') or [])
+            if (e.get('status') or '').upper() == 'COMPLETED']
+    vals = [e.get('end_to_end_duration') or e.get('duration') or 0 for e in hist]
+    vals = [v for v in vals if v > 0]
+    if len(vals) >= 3:
+        recent += 1
+        p95s.append(p95(vals))
+    else:
+        # history 太短（作业刚起、还没跑满 3 次）：这时全量 summary 反而是唯一能用的
+        p = c.get('summary', {}).get('end_to_end_duration', {}).get('p95', 0) or 0
+        if p:
+            p95s.append(p)
+print('%d\t%d\t%d' % (max(p95s) if p95s else 0, running, recent))
+" 2>/dev/null || echo "0	0	0")
 CKPT_P95=$(num_or "$(echo "$CKPT_LINE" | cut -f1)" 0)
 JOBS_RUNNING=$(num_or "$(echo "$CKPT_LINE" | cut -f2)" 0)
+CKPT_RECENT=$(num_or "$(echo "$CKPT_LINE" | cut -f3)" 0)
 
 echo "==> 采集 Kafka 侧指标"
 KAFKA_LAG=0
 DUP_RATE=0
 DUP_CNT=0
 LATE_RATIO=0
+# 窗口大小要在这里就定好，不能留在下面的 if 里：--skip-kafka 时那个分支不执行，
+# 而写库的阈值说明里要引用 $WINDOW，留下就是 "WINDOW: unbound variable"
+# （set -u 会直接中断，表现为「采集跑完但一条都没写进去」）。
+WINDOW="${HEALTH_WINDOW:-3000}"
+N_PART="${HEALTH_PARTITIONS:-3}"
 
 if [[ "$SKIP_KAFKA" -eq 0 ]]; then
   # 三个消费者组的 lag 相加：DWD 清洗 / ODS 落湖 / 漏斗，各自独立消费同一 topic
@@ -157,8 +224,6 @@ if [[ "$SKIP_KAFKA" -eq 0 ]]; then
   # 乱序统计**必须按分区独立维护最大事件时间**：三个分区是并行消费的，把它们
   # 合并成一条流来比较，会把「分区 A 的旧事件恰好排在分区 B 的新事件之后」
   # 误判成乱序。加 print.partition=true 拿到分区号后分桶维护。
-  WINDOW="${HEALTH_WINDOW:-3000}"
-  N_PART="${HEALTH_PARTITIONS:-3}"
   PER_PART=$(( WINDOW / N_PART ))
   [[ "$PER_PART" -lt 1 ]] && PER_PART=1
 
@@ -219,8 +284,30 @@ fi
 # ---------------------------------------------------------------------------
 # 阈值判定 + 写入
 # ---------------------------------------------------------------------------
-E2E_MS=3849          # P3 实测单次采样，见 docs/03 §5 实测基线
-E2E_LEVEL=$(level_of 5000 15000 "$E2E_MS")
+# 端到端延迟：优先用 check_lag.py 的实测 P99，没有则退回 P3 的历史基线。
+# 阈值跟着架构走 —— sink 的 buffer-flush.interval 是 10s，任何测量都不可能低于它，
+# 所以「5000ms 就算慢」是错的阈值：它会把一个设计正常的链路永久标黄。
+LATENCY_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.latency.json"
+E2E_LINE=""
+if [[ -f "$LATENCY_FILE" ]]; then
+  E2E_LINE=$(python -c "
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+print('%d\t%d\t%s' % (round(d.get('p99') or 0), d.get('samples') or 0,
+                      d.get('measured_at') or '?'))
+" "$LATENCY_FILE" 2>/dev/null || true)
+fi
+E2E_MEASURED=$(num_or "$(echo "$E2E_LINE" | cut -f1)" 0)
+if [[ "$E2E_MEASURED" -gt 0 ]]; then
+  E2E_MS="$E2E_MEASURED"
+  E2E_SAMPLES=$(num_or "$(echo "$E2E_LINE" | cut -f2)" 0)
+  E2E_AT=$(num_or "$(echo "$E2E_LINE" | cut -f3)" "?")
+  E2E_DESC="kafka→doris 实测 P99（N=$E2E_SAMPLES，采于 $E2E_AT）。**下限是 sink flush 间隔 10s**，<12000 ok / <20000 warn"
+else
+  E2E_MS=3849
+  E2E_DESC="P3 单次实测基线 **不是 P99**；跑 scripts/check_lag.py --write 换成实测值。<5000 ok / <15000 warn"
+fi
+E2E_LEVEL=$(level_of 12000 20000 "$E2E_MS")
 
 EVENT_AGE_LEVEL=$(level_of 86400 259200 "$EVENT_AGE_P99")   # 1天 warn / 3天 critical
 FRESH_LEVEL=$(level_of 300 3600 "$FRESHNESS")
@@ -231,31 +318,45 @@ CKPT_LEVEL=$(level_of 5000 15000 "$CKPT_P95")
 CANCEL_LEVEL=$(level_of 1 3 "$CANCELED_RATIO")
 
 echo "==> 写入 ads_pipeline_health"
+# 拆成两条写：Kafka 那三个指标在 --skip-kafka 时**根本没采**，
+# 写 0 会被读成「零重复、零积压」，又是一个「没测量却报好消息」的假象。
+# 没采就不写，让它保留上一次的值 —— 面板上看到的是「上次采集」的数字，
+# 而不是一个凭空捏造的 0。
 MSYS_NO_PATHCONV=1 docker exec -i rt-doris-fe mysql -h127.0.0.1 -P9030 -uroot -D realtime_dw -e "
 INSERT INTO ads_pipeline_health
   (metric_key, metric_name, metric_value, metric_unit, metric_level, threshold_desc, metric_group, collect_time)
 VALUES
   ('e2e_latency_ms',    '端到端延迟',      $E2E_MS,         'ms',  '$E2E_LEVEL',
-   '单次实测 3849ms（P3，非 P99）；理论最差≈checkpoint 间隔 10s。<5000 ok / <15000 warn', 'delay',   NOW()),
+   '$E2E_DESC', 'delay',   NOW()),
   ('pipeline_freshness_s','管道新鲜度',    $FRESHNESS,      's',   '$FRESH_LEVEL',
    '最近一次成功写入距今。反映链路是否还活着。<300 ok / <3600 warn', 'delay',   NOW()),
   ('event_age_p99_s',   '事件年龄 P99',    $EVENT_AGE_P99,  's',   '$EVENT_AGE_LEVEL',
-   '入库时刻-事件时间。**不是延迟**：生成器有 1h 回填，天然小时级。<1天 ok', 'quality', NOW()),
-  ('dup_rate',          '事件重复率',      $DUP_RATE,       '%',   '$DUP_LEVEL',
-   '最近 $WINDOW 条窗口内 1-COUNT(DISTINCT event_id)/COUNT(*)。**不能用全量口径**，会被历史稀释。<1% ok / <5% warn', 'quality', NOW()),
-  ('late_ratio',        '事件乱序比例',    $LATE_RATIO,     '%',   '$LATE_LEVEL',
-   '最近 $WINDOW 条窗口内落后最大事件时间 >60s 的比例。<5% ok / <20% warn', 'quality', NOW()),
+   '$EVENT_AGE_DESC', 'quality', NOW()),
   ('canceled_gmv',      '无效交易金额',    $CANCELED_GMV,   '元',  '$CANCEL_LEVEL',
    'canceled+unavailable 的 GMV 合计，涉及 $CANCELED_ORDERS 个订单。**仍计入 GMV 口径**，净 GMV = GMV − 本值', 'quality', NOW()),
   ('canceled_ratio',    '无效交易占比',    $CANCELED_RATIO, '%',   '$CANCEL_LEVEL',
    '无效交易金额 / 总 GMV。<1% ok / <3% warn', 'quality', NOW()),
-  ('kafka_lag',         'Kafka 积压',      $KAFKA_LAG,      '条',  '$LAG_LEVEL',
-   '三个消费者组 lag 之和。<1000 ok / <10000 warn', 'capacity', NOW()),
   ('checkpoint_p95_ms', 'Checkpoint P95',  $CKPT_P95,       'ms',  '$CKPT_LEVEL',
-   '运行中作业最近 20 次已完成 checkpoint 的 P95。<5000 ok / <15000 warn', 'capacity', NOW()),
+   '运行中作业最近 10 次已完成 checkpoint 的 P95（history 口径，不是全生命周期 summary）。$CKPT_RECENT 个作业样本足够。<5000 ok / <15000 warn', 'capacity', NOW()),
   ('flink_jobs_running','运行中作业数',    $JOBS_RUNNING,   '个',  'ok',
    '状态为 RUNNING 的 Flink 作业数。4 slots 集群期望 3-4 个', 'capacity', NOW());
 " 2>&1 | head -5
+
+if [[ "$SKIP_KAFKA" -eq 0 ]]; then
+  MSYS_NO_PATHCONV=1 docker exec -i rt-doris-fe mysql -h127.0.0.1 -P9030 -uroot -D realtime_dw -e "
+INSERT INTO ads_pipeline_health
+  (metric_key, metric_name, metric_value, metric_unit, metric_level, threshold_desc, metric_group, collect_time)
+VALUES
+  ('dup_rate',          '事件重复率',      $DUP_RATE,       '%',   '$DUP_LEVEL',
+   '最近 $WINDOW 条窗口内 1-COUNT(DISTINCT event_id)/COUNT(*)。**不能用全量口径**，会被历史稀释。<1% ok / <5% warn', 'quality', NOW()),
+  ('late_ratio',        '事件乱序比例',    $LATE_RATIO,     '%',   '$LATE_LEVEL',
+   '最近 $WINDOW 条窗口内落后最大事件时间 >60s 的比例。<5% ok / <20% warn', 'quality', NOW()),
+  ('kafka_lag',         'Kafka 积压',      $KAFKA_LAG,      '条',  '$LAG_LEVEL',
+   '三个消费者组 lag 之和。<1000 ok / <10000 warn', 'capacity', NOW());
+" 2>&1 | head -5
+else
+  echo "    --skip-kafka：dup_rate / late_ratio / kafka_lag 保留上次采集值"
+fi
 
 echo
 echo "==> 采集结果"

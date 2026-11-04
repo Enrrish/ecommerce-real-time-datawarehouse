@@ -110,7 +110,12 @@ CREATE TABLE src_user_event (
   -- 与 ODS 侧保持一致：缺字段解析成 NULL 而不是让作业挂掉。
   -- 真正的契约校验放在下面的 is_valid 里做，这样能**看见**脏数据有多少，
   -- 而不是靠作业失败来间接发现。
-  'json.fail-on-missing-field' = 'false'
+  'json.fail-on-missing-field' = 'false',
+  -- 解析失败（类型不对、JSON 截断）整条丢弃，不让作业无限重启。
+  -- 理由与 ODS 侧第 3 条相同：实测一条脏消息就能让位点永远卡住、积压涨到 5.4 万条，
+  -- 「硬失败守住契约」在 Kafka 这种只读追加的源上不成立。
+  -- 丢弃条数看 source 的 numRecordsInErrors 指标。
+  'json.ignore-parse-errors' = 'true'
 );
 
 

@@ -156,7 +156,15 @@ PROPERTIES (
 -- 转化率两列的分母不同，别混：
 --   `conv_rate_vs_prev`  = 本环节 UV / 上一环节 UV   → 看单步流失
 --   `conv_rate_vs_first` = 本环节 UV / page_view UV → 看全程转化
--- 首环节（page_view）两列都是 1.0000，是定义使然，不是算错。
+--
+-- 首环节（page_view）的表现**不对称**，这不是 bug：
+--   `conv_rate_vs_first` = 1.0000  —— 自己除自己，定义使然
+--   `conv_rate_vs_prev`  = NULL    —— 「上一环节」不存在，除法无定义
+--
+-- 为什么不让它等于 1：那会暗示「进入首页的转化率是 100%」，而首页前面
+-- 其实什么都没有。NULL 在语义上是「无此环节」，1.0000 是「有且为满」。
+-- 前端也是按这个约定写的（charts.js 里 i > 0 才取 conv_prev），
+-- 第 1 根柱子不显示单步转化率。要改成 1.0000 的话两处都得改。
 CREATE TABLE IF NOT EXISTS `ads_funnel_1d` (
   `dt`                 DATE          NOT NULL COMMENT '事件日期',
   `step`               VARCHAR(20)   NOT NULL COMMENT 'page_view / add_cart / checkout / pay',

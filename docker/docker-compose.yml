@@ -289,7 +289,20 @@ services:
     ports:
       - "${DORIS_BE_HTTP_PORT:-8040}:8040"
     volumes:
-      - ./volumes/doris-be/doris-storage:/opt/apache-doris/be/storage
+      # BE 的 storage 必须用命名卷，不能 bind mount 到宿主机目录。
+      #
+      # Docker Desktop on Windows 把宿主机目录导成 9p，statvfs 返回的 inode 是假数据：
+      # `df -i` 实测 f_files=999、f_ffree=-999001 —— 可用 inode 是负数。Doris 启动时会
+      # 检查每块盘的可用性，把它判成「inode 用尽」，日志打
+      #   a broken disk is found /opt/apache-doris/be/storage
+      #   All disks are broken, exit.
+      # 然后无限重启（ignore_broken_disk=true 也救不了，因为它是「全部盘都坏」）。
+      # 容量那一项（df -h）反而是正常的，所以只看容量根本看不出问题。
+      #
+      # 命名卷落在 WSL 的 ext4 上，df -i 有 6700 万个 inode，一切正常。
+      # 排查入口是 `df -T`（看文件系统类型）和 `df -i`（看 inode），不是 `df -h`。
+      - rt-doris-be-data:/opt/apache-doris/be/storage
+      # 日志留在 bind mount，方便直接在资源管理器里翻
       - ./volumes/doris-be/log:/opt/apache-doris/be/log
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8040/api/health >/dev/null 2>&1 || exit 1"]
@@ -316,4 +329,18 @@ networks:
     ipam:
       config:
         - subnet: 172.28.0.0/24
+
+# =============================================================================
+# 命名卷
+# -----------------------------------------------------------------------------
+# 只给 Doris BE 的 storage 用（原因见 doris-be 服务里的注释）。
+# `name:` 写死，避免 compose 按目录名加前缀生成 rt_doris-be-data 之类的名字 ——
+# 迁移脚本和排障命令里要能直接写死这个名字。
+#
+# 注意：`docker compose down -v` 会连它一起删。这是有意的 —— 想彻底重来就删，
+# 想保留数据就只 `down`（不加 -v）。
+# =============================================================================
+volumes:
+  rt-doris-be-data:
+    name: rt-doris-be-data
 

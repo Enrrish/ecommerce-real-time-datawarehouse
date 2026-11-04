@@ -8,6 +8,44 @@
 
 ---
 
+## 0. 快速开始（5 条命令）
+
+前置：Docker Desktop 已启动（WSL2 后端，内存上限 10GB）；`data/raw/olist/` 下已放好 9 个 CSV
+（下载方式见 [data/README.md](data/README.md)）。首次跑要拉 11.6GB 镜像，约 25 分钟。
+
+```bash
+# 1. 依赖（只有埋点生成要第三方库；其余脚本纯标准库）
+python -m pip install -r scripts/requirements.txt
+
+# 2. 四个 connector jar → docker/flink/lib/（约 52MB，含单独放的 MySQL JDBC 驱动）
+bash scripts/fetch-flink-jars.sh
+
+# 3. 起 MySQL、导入 Olist 155 万行、跑九表核对（约 3 分钟）
+bash scripts/import.sh
+
+# 4. 一条命令把链路跑起来：六个容器 → 建 Kafka topic → 建 Doris 库表
+#    → 回填宽表与日粒度 → 提 4 个常驻作业 → 开大屏（带持续埋点）
+bash scripts/demo.sh --with-events
+
+# 5. 浏览器打开 http://127.0.0.1:8080/
+```
+
+`demo.sh` 是幂等的：容器在跑就跳过、topic 存在就跳过、表里有数就跳过、作业在跑就跳过。
+重复执行只会补上缺的部分。
+
+三件容易踩的事，脚本已经替你处理了：
+
+| 坑 | 不处理的后果 |
+| --- | --- |
+| Kafka topic 必须先建成 **3 分区** | Kafka 会自动建，但建成 **1 分区**。漏斗的会话归因、dup/late 抽样的分区假设全部失效，且**不报任何错** |
+| Doris BE 的 storage 必须用**命名卷** | 挂到宿主机目录时 Docker Desktop 导成 9p，`statvfs` 的 inode 是假数据（可用 inode 为负），BE 判「所有盘都损坏」无限重启。见 `docs/04 §6` |
+| 4 个 slot 装不下 6 个作业 | 订单宽表与日粒度汇总是**一次性**的，`demo.sh` 跑完就取消，把 slot 还给常驻作业 |
+
+不想开大屏只想把后端跑起来：`bash scripts/demo.sh --no-dashboard`。
+想验证端到端延迟：`python scripts/check_lag.py --write`（真采 200 条探针算 P99）。
+
+---
+
 ## 1. 项目目标
 
 | 目标 | 落地方式 |
@@ -99,7 +137,7 @@ flowchart LR
 │   ├── mysql/             # 业务库建表 01-schema + 验收 02-verify
 │   └── doris/             # 四层建表 01/03/05/07 + 刷新 08 + 验收 02/06/09
 ├── flink/sql/             # Flink SQL 作业，按分层编号
-├── scripts/               # 数据装载、埋点生成、jar 下载、作业提交
+├── scripts/               # 数据装载、埋点生成、jar 下载、作业提交、健康度采集、一键启动
 ├── dashboard/             # 实时大屏：静态页 + Python 查询代理 + 四档 ADS 刷新
 └── docs/                  # 架构、分层模型、指标口径、环境、路线图
 ```
@@ -141,6 +179,7 @@ flowchart LR
 - [x] ADS 应用层（7 张表，Doris 侧全量刷新）
 - [x] 脏数据注入与指标基线对照（3,001 条 + 3% 重复 / 5% 乱序，三层都不被污染）
 - [x] 大屏接入 ADS 实数据（三屏九块全真数据，改 MySQL → 大屏 0.24~3.1s 可见）
+- [x] 一键启动脚本 `demo.sh` 与端到端延迟真采样 `check_lag.py`（P8）
 
 ---
 

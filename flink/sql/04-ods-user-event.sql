@@ -45,11 +45,29 @@ SET 'table.local-time-zone' = 'Asia/Shanghai';
 --    位点就丢了。设了 group.id 才有第二道保险。
 --    注意：group.id 不能和 9 个 CDC 作业重复，它们是两套完全独立的消费者。
 --
--- 3) 不设 json.ignore-parse-errors。
---    默认 false 意味着格式不对就抛异常、作业失败重启 —— 这是**故意的**。
---    埋点链路的契约（schema_version）就是要靠硬失败来守住；如果设成 true，
---    字段改名后所有消息会被静默解析成 NULL，Doris 里看到一堆空行却报不出错。
---    上游要做的是保证契约，不是让下游宽容。
+-- 3) json.ignore-parse-errors = 'true' —— **这一条改过，理由变了**
+--    最初的决定是「不设，让格式错误硬失败」：认为埋点契约（schema_version）
+--    要靠作业失败来守住，宽容会把「字段改名」变成一堆静默的 NULL。
+--    这个想法在 P8 被实测推翻，代价是两次真实停摆：
+--      · 一条 2 字节的 `{}`  → event_id 为 NULL → ConstraintEnforcer 抛异常
+--      · 40 条把 schema_version 写成字符串 "1.0" 的探针 → JSON 解析异常
+--    两次结果一样：**作业无限重启，位点永远停在它前面，Kafka 积压涨到 5.4 万条**，
+--    UI 上只是反复 RESTARTING。所谓「硬失败守住契约」的前提是失败后有人去修数据，
+--    可 Kafka 是只读追加的，那条消息永远在那儿 —— 唯一的恢复手段是人工改消费位点。
+--    这不是守住契约，是把「一条脏消息」放大成「整条链路停摆 + 手工救火」。
+--
+--    真正的守约方式是**让它继续跑，同时把错误数暴露出来**：Flink 的 source 会记
+--    `numRecordsInErrors`（解析失败条数），DWD 还有 `is_valid` 记录字段级问题。
+--    可观测的丢弃，比不可恢复的失败有用。
+--
+--    它只作用于「解析失败」：一条消息解析失败就整条丢弃，不会变成一堆 NULL 行
+--    混进 Doris。字段缺失是另一码事，由下面的 WHERE 兜。
+--
+-- 4) 但要过滤掉**没有主键**的消息（见下面 INSERT 的 WHERE）。
+--    `{}` 这种消息能解析成功（所有字段缺失 = 全 NULL），只是没有 event_id，
+--    而 sink 声明了 PRIMARY KEY (event_id) NOT ENFORCED，没有主键就落不了库。
+--    丢多少是可查的：topic 条数 − ods_user_event 行数。
+--    DWD 侧对这件事的处理完全一样（06 的硬过滤），两层的口径要对齐。
 CREATE TABLE src_user_event (
   schema_version INT,
   event_id       STRING,
@@ -66,7 +84,9 @@ CREATE TABLE src_user_event (
   'properties.group.id' = 'flink-ods-user-event',
   'scan.startup.mode' = 'earliest-offset',
   'format' = 'json',
-  'json.fail-on-missing-field' = 'false'
+  'json.fail-on-missing-field' = 'false',
+  -- 见文件头第 3 条：解析失败整条丢弃，不再让作业无限重启
+  'json.ignore-parse-errors' = 'true'
 );
 
 -- -----------------------------------------------------------------------------
@@ -120,7 +140,18 @@ SELECT
   session_id,
   product_id,
   page_url,
-  schema_version,
+  -- schema_version 用 COALESCE 兜 0：0 表示「上游没标注版本」，与真实版本号 1 区分得开。
+  -- 起因是一次实测事故：topic 里混进 30 多条早期探针消息（user_id=probe_u0 那批），
+  -- 它们没有 schema_version 字段 → 解析成 NULL → Doris 的 NOT NULL 拒收整批 →
+  -- 报 "column(schema_version) values is null while columns is not nullable"
+  -- → 作业重启 → 又读到同一批 → 又拒收。Kafka 积压从 0 涨到 5.4 万条，作业状态
+  -- 在 UI 上一直是 RESTARTING。
+  --
+  -- 为什么这里兜住它、而上一条又说「契约要靠硬失败守住」：
+  -- schema_version 描述的是**契约本身**，不是业务数据。一条没声明版本的消息
+  -- 不等于违约，它只是来自一个老的生产者 —— 把它记成 0 是无损的（信息没丢，
+  -- 「未标注」本身就被记录下来了）。而字段改名后静默解析成 NULL 才是真的丢信息。
+  COALESCE(schema_version, 0) AS schema_version,
   -- dt = 业务事件日期，与另 9 张表的「落地日期」口径不同，理由见文件头
   CAST(TO_TIMESTAMP(event_time, 'yyyy-MM-dd HH:mm:ss.SSS') AS DATE) AS `dt`,
   -- ts_ms = 入库时刻。这里用 UNIX_TIMESTAMP() 无参版本取处理时间，
@@ -128,4 +159,10 @@ SELECT
   -- MILLISECOND 单位返回 INT，2026 年的 1.77e12 会溢出）。
   -- 对「链路延迟」这个用途足够：本管道的延迟量级是秒到十秒，±1 秒无影响。
   UNIX_TIMESTAMP() * 1000 AS `ts_ms`
-FROM src_user_event;
+FROM src_user_event
+-- 两条 WHERE 都是「这行本来就不可能落库」的过滤，理由见文件头第 4 条：
+--   * 没有 event_id → 没有主键，UNIQUE 模型收不了
+--   * 没有 event_time → dt 算不出来，而 dt 也是 NOT NULL
+-- 这两类行既不进 Doris、也就没法去重，留着只会让作业永远重启。
+WHERE event_id IS NOT NULL AND TRIM(event_id) <> ''
+  AND event_time IS NOT NULL;
