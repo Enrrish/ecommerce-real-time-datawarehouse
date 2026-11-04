@@ -260,7 +260,7 @@ DUP_RATE=0
 DUP_CNT=0
 LATE_RATIO=0
 # 窗口大小要在这里就定好，不能留在下面的 if 里：--skip-kafka 时那个分支不执行，
-# 而写库的阈值说明里要引用 $WINDOW，留下就是 "WINDOW: unbound variable"
+# 而后面的 PER_PART 和采样说明都要引用 $WINDOW，留在 if 里就是 "WINDOW: unbound variable"
 # （set -u 会直接中断，表现为「采集跑完但一条都没写进去」）。
 WINDOW="${HEALTH_WINDOW:-3000}"
 N_PART="${HEALTH_PARTITIONS:-3}"
@@ -305,8 +305,19 @@ if [[ "$SKIP_KAFKA" -eq 0 ]]; then
   done
 
   # 注意 awk 用绝对路径 /usr/bin/awk：容器里没有 `gawk` 这个命令名，
-  # 但 /usr/bin/awk 就是 gawk（mktime 可用），写成 gawk 会 command not found。
+  # 但 /usr/bin/awk 就是 gawk（mktime / systime 可用），写成 gawk 会 command not found。
+  #
+  # 为什么要按「近期」过滤掉回填事件（HORIZON）：
+  #   这个窗口里经常同时有「批量回填」和「实时流」两种流量。回填事件的 event_time
+  #   是 1 小时甚至更早以前的，一旦它前面出现过一条新鲜事件，本分区已见最大值就被
+  #   抬到「现在」，于是整批回填事件都落后 >60s，全部计入乱序。
+  #   实测：注入 5% 乱序（100/2000）后指标报 **66.67%** —— 报的根本不是那 5%，
+  #   而是「这批数据整体是旧的」。同理，混合流量下这个值会结构性地飘到 30% 上下，
+  #   于是阈值 <5% 天天 critical，变成一条只会喊狼来了的指标。
+  #   分工：回填有多旧，看 event_age_p99_s（它就是这个用途）；late_ratio 只看
+  #   近 HORIZON 秒内的事件 —— 那才是「到达顺序与事件时间不一致」。
   STATS=$(printf '%s' "$SAMPLE" | MSYS_NO_PATHCONV=1 docker exec -i rt-kafka /usr/bin/awk '
+    BEGIN { nowms = systime() * 1000; HORIZON = 600000 }
     {
       # print.partition=true 的输出形如 "Partition:0\t{...}"，先把分区号取出来
       if (match($0, /^Partition:[0-9]+/)) {
@@ -319,28 +330,43 @@ if [[ "$SKIP_KAFKA" -eq 0 ]]; then
       if (p == 0 || q == 0) next
       eid = substr($0, p + 13, 36)
       s   = substr($0, q + 15, 23)
-      tot++
+      n_all++
+      # 重复率和时间无关，照全量算（幂等是幂等，不分新旧）
       if (eid in seen) dup++; else seen[eid] = 1
 
       # 事件时间转 epoch 毫秒，统计「比**本分区**已见最大值落后 > 60s」的比例
       d = substr(s,1,10); t = substr(s,12,8); ms = substr(s,21,3)
       split(d,dd,"-"); split(t,tt,":")
       ep = mktime(dd[1]" "dd[2]" "dd[3]" "tt[1]" "tt[2]" "tt[3]) * 1000 + ms
+      # 回填/重放事件（比现在旧 HORIZON 以上）不进乱序的分子分母 —— 见上面的说明。
+      # 它们不是「乱序到达」，是「生来就旧」，那件事由 event_age_p99_s 负责。
+      if (ep < nowms - HORIZON) { old++; next }
+      tot++
       if (ep > maxep[part]) maxep[part] = ep
       else if (maxep[part] - ep > 60000) late++
     }
     END {
-      if (tot == 0) { print "0\t0\t0\t0" }
-      else printf "%.4f\t%d\t%.4f\t%d\n", dup*100.0/tot, dup, late*100.0/tot, tot
+      if (n_all == 0) { print "0\t0\t0\t0\t0" }
+      else printf "%.4f\t%d\t%.4f\t%d\t%d\n",
+                  dup*100.0/n_all, dup, (tot ? late*100.0/tot : 0), tot, old
     }')
   DUP_RATE=$(num_or "$(echo "$STATS" | cut -f1)" 0)
   DUP_CNT=$(num_or "$(echo "$STATS" | cut -f2)" 0)
   LATE_RATIO=$(num_or "$(echo "$STATS" | cut -f3)" 0)
   SAMPLED=$(num_or "$(echo "$STATS" | cut -f4)" 0)
-  echo "    抽样 $SAMPLED 条（$N_PART 分区各 $PER_PART）：重复 $DUP_CNT 条（${DUP_RATE}%），乱序 ${LATE_RATIO}%"
+  BACKFILL=$(num_or "$(echo "$STATS" | cut -f5)" 0)
+  echo "    抽样 $((SAMPLED + BACKFILL)) 条（$N_PART 分区各 $PER_PART）：重复 $DUP_CNT 条（${DUP_RATE}%），乱序 ${LATE_RATIO}%（参与判定 $SAMPLED 条，回填 $BACKFILL 条已排除）"
+  if [[ "$SAMPLED" -eq 0 ]]; then
+    echo "    ⚠ 近 10 分钟内一条都没有，乱序率无从判定 —— 这一项本次不写，不报 0"
+    LATE_MEASURED=0
+  else
+    LATE_MEASURED=1
+  fi
 else
   echo "    已跳过"
   SAMPLED=0
+  BACKFILL=0
+  LATE_MEASURED=0
 fi
 
 # ---------------------------------------------------------------------------
@@ -442,16 +468,22 @@ VALUES
 " 2>&1 | head -5
 
 if [[ "$SKIP_KAFKA" -eq 0 ]]; then
+  # 乱序率单独一行，且只在「确实有近期样本」时写：近 10 分钟内一条事件都没有的话，
+  # 分母是 0，写 0% 就成了「零乱序，很健康」—— 又一个「没测到却报好消息」。
+  LATE_ROW=""
+  if [[ "$LATE_MEASURED" -eq 1 ]]; then
+    LATE_ROW=",
+  ('late_ratio',        '事件乱序比例',    $LATE_RATIO,     '%',   '$LATE_LEVEL',
+   '近 10 分钟内 $SAMPLED 条里，比**本分区**已见最大事件时间落后 >60s 的比例。回填/重放的 $BACKFILL 条已排除 —— 那件事看「事件年龄 P99」，混在一起会报成 66%。<5% ok / <20% warn', 'quality', NOW())"
+  fi
   MSYS_NO_PATHCONV=1 docker exec -i rt-doris-fe mysql -h127.0.0.1 -P9030 -uroot -D realtime_dw -e "
 INSERT INTO ads_pipeline_health
   (metric_key, metric_name, metric_value, metric_unit, metric_level, threshold_desc, metric_group, collect_time)
 VALUES
   ('dup_rate',          '事件重复率',      $DUP_RATE,       '%',   '$DUP_LEVEL',
-   '最近 $WINDOW 条窗口内 1-COUNT(DISTINCT event_id)/COUNT(*)。**不能用全量口径**，会被历史稀释。<1% ok / <5% warn', 'quality', NOW()),
-  ('late_ratio',        '事件乱序比例',    $LATE_RATIO,     '%',   '$LATE_LEVEL',
-   '最近 $WINDOW 条窗口内落后最大事件时间 >60s 的比例。<5% ok / <20% warn', 'quality', NOW()),
+   '抽样窗口内 1-COUNT(DISTINCT event_id)/COUNT(*)。**不能用全量口径**，会被历史稀释。<1% ok / <5% warn', 'quality', NOW()),
   ('kafka_lag',         'Kafka 积压',      $KAFKA_LAG,      '条',  '$LAG_LEVEL',
-   '三个消费者组 lag 之和。<1000 ok / <10000 warn', 'capacity', NOW());
+   '三个消费者组 lag 之和。<1000 ok / <10000 warn', 'capacity', NOW())$LATE_ROW;
 " 2>&1 | head -5
 else
   echo "    --skip-kafka：dup_rate / late_ratio / kafka_lag 保留上次采集值"
