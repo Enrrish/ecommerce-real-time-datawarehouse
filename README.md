@@ -33,13 +33,14 @@ bash scripts/demo.sh --with-events
 `demo.sh` 是幂等的：容器在跑就跳过、topic 存在就跳过、表里有数就跳过、作业在跑就跳过。
 重复执行只会补上缺的部分。
 
-三件容易踩的事，脚本已经替你处理了：
+四件容易踩的事（前三件 `demo.sh` 已经替你处理，第四件由 `demo-change.sh` 的自检兜住）：
 
 | 坑 | 不处理的后果 |
 | --- | --- |
 | Kafka topic 必须先建成 **3 分区** | Kafka 会自动建，但建成 **1 分区**。漏斗的会话归因、dup/late 抽样的分区假设全部失效，且**不报任何错** |
 | Doris BE 的 storage 必须用**命名卷** | 挂到宿主机目录时 Docker Desktop 导成 9p，`statvfs` 的 inode 是假数据（可用 inode 为负），BE 判「所有盘都损坏」无限重启。见 `docs/04 §6` |
 | 4 个 slot 装不下 6 个作业 | 订单宽表与日粒度汇总是**一次性**的，`demo.sh` 跑完就取消，把 slot 还给常驻作业 |
+| 重提 `07` 后要等 1~2 分钟快照 | 作业状态立刻变 RUNNING，但 `initial` 快照还没跑完时它一行都不写。**RUNNING 不等于在产出** —— 判据是 `bash scripts/demo-change.sh` 第 0 步的自检（四个源累计读满 40 万行） |
 
 不想开大屏只想把后端跑起来：`bash scripts/demo.sh --no-dashboard`。
 想验证端到端延迟：`python scripts/check_lag.py --write`（真采 200 条探针算 P99）。
