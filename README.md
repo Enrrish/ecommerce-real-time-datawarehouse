@@ -34,11 +34,24 @@ bash scripts/stop.sh
 ```
 
 **别用 `docker compose down -v` 关。** 那会把 Doris BE 的命名卷 `rt-doris-be-data`
-一起删掉——不是「重启一下」，是 112,650 行 DWD + 88,157 行 DWS + 8 张 ADS 全部消失，
+一起删掉——不是「重启一下」，是 112,650 行 DWD + 88,157 行 DWS + 7 张 ADS 全部消失，
 得从 MySQL 重跑 41 万行快照重建。`stop.sh` 任何分支都不带 `-v`。
 
 `demo.sh` 是幂等的：容器在跑就跳过、topic 存在就跳过、表里有数就跳过、作业在跑就跳过。
 重复执行只会补上缺的部分。
+
+> **在 PowerShell 里跑？** 上面前提是 Git Bash。PowerShell 里直接敲 `bash scripts/stop.sh`
+> 会失败——PATH 里没有 `…\Git\bin`，`bash` 被 `C:\Windows\System32\bash.exe`（WSL 的启动垫片）
+> 抢走，回车后只会得到 `Access is denied` 或一句 WSL 的报错，**看起来像脚本坏了**。
+> 用绝对路径调它（`where.exe git` 确认装在哪，把 `\cmd\git.exe` 换成 `\bin\bash.exe`）：
+>
+> ```powershell
+> & "C:\Program Files\Git\bin\bash.exe" scripts\stop.sh
+> ```
+>
+> 往 PATH 里加 `…\Git\bin` 没用：Windows 把机器级 PATH 排在用户级前面，System32 仍然赢。
+> 想长期省事就在 PowerShell 配置文件里加
+> `function bash { & "C:\Program Files\Git\bin\bash.exe" @args }`。
 
 四件容易踩的事（前三件 `demo.sh` 已经替你处理，第四件由 `demo-change.sh` 的自检兜住）：
 
@@ -188,7 +201,8 @@ flowchart LR
 - [x] DWS 汇总层（分钟 · 小时 · 日共 6 张预聚合表，与 DWD 重算 diff 全 0）
 - [x] ADS 应用层（7 张表，Doris 侧全量刷新）
 - [x] 脏数据注入与指标基线对照（3,001 条 + 3% 重复 / 5% 乱序，三层都不被污染）
-- [x] 大屏接入 ADS 实数据（三屏九块全真数据，改 MySQL → 大屏 0.24~3.1s 可见）
+- [x] 大屏接入 ADS 实数据（三屏九块全真数据；改 MySQL → 大屏 0.24~3.1s，P7 口径 = 主动触发 ADS 刷新）
+  - 不触发刷新、只等 60s 批刷周期的真实等待是 **17~60s**，两个都对，别混着引（见 [docs/03 §实测基线](docs/03-指标口径.md)）
 - [x] 一键启动脚本 `demo.sh` 与端到端延迟真采样 `check_lag.py`（P8）
 
 ---
@@ -201,10 +215,10 @@ flowchart LR
 
 - WSL2 上限锁 10GB，六个容器 limit 合计 **8.75GB**（明细见 [docs/04 §4](docs/04-环境搭建.md)）
 - 容器按 `source` / `compute` / `olap` 三组 profile 分批启动，避免 BE 与 TM 同时拉起触发 OOM Killer
-- Doris 单 BE、单副本（`replication_num=1`）、BE 内存上限 2.5G
+- Doris 单 BE、单副本（`replication_num=1`）、BE 内存上限 1.75G（活跃数据只有 400MB）
 - Flink 单 TM / **4 slots**，每个作业并行度 1（4 个常驻作业占满），Checkpoint 10s 落本地文件系统
-  - 不用 10 slots：TM 的 taskHeap 按 slot 数均分（868MB ÷ 10 = 87MB），六表 join 跑不动；
-    ÷ 4 = 217MB 才行。降 slot 数比加内存总量对症（见 `docs/04 §6`）
+  - 不用 10 slots：TM 的 taskHeap 按 slot 数均分（1489MB ÷ 10 = 149MB），六表 join 跑不动；
+    ÷ 4 = 372MB 才行。降 slot 数比加内存总量对症（见 `docs/04 §6`）
 
 ---
 

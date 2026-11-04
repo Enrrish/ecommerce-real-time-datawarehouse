@@ -108,9 +108,14 @@ state.backend.incremental: true
 ```
 
 > **`numberOfTaskSlots` 是内存切分粒度，不是"能跑几个作业"的开关。**
-> TM 的 taskHeap（实测 868MB）按 slot 数**均分**：10 个 slot 时每个只有 86.8MB，
-> 跑单流同步够，跑 6 表 join 不够；降到 4 个后每 slot 217MB。作业少的时候降 slot 数
+> TM 的 taskHeap（实测 1489MB）按 slot 数**均分**：10 个 slot 时每个只有 148.9MB，
+> 跑单流同步够，跑 6 表 join 不够；降到 4 个后每 slot 372MB。作业少的时候降 slot 数
 > 集中内存给重作业，ODS 那种单流作业多的时候再调回 10。这一步不需要改内存总量。
+>
+> 这个 **1489** 不是拿 process.size 乘个比例估的，是 Flink 内存模型算出来的：
+> `3072 − metaspace 256 − JVM overhead 307 = 2509`（total flink），
+> `2509 − managed 512 − network 256 − framework heap/offheap 各 128 = 1489`。
+> 早期写「217MB/slot」时 process.size 才 2304m，taskHeap 只有 868MB。
 >
 > **Checkpoint 间隔就是数据可见延迟的上限**，不是「30s 更保险」。Doris Connector 靠
 > checkpoint 触发 Stream Load 提交，间隔设太大，现象是「作业 RUNNING 但 Doris 查不到数据」。

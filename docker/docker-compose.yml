@@ -230,8 +230,8 @@ services:
         # process.size 必须比 mem_limit 小约 10%：差额是 JVM 之外的线程栈、
         # page cache 与容器自身开销，留不够会被 cgroup OOM Kill（不是 Java OOM）。
         #
-        # 2304m 实测：taskHeap 868MB、managed 512MB、network 181.8MB。
-        # 这 868MB 是按 numberOfTaskSlots **均分**的 —— 10 个 slot 时每个只有
+        # 旧配置 2304m 实测：taskHeap 868MB、managed 512MB、network 181.8MB。
+        # 那 868MB 是按 numberOfTaskSlots **均分**的 —— 10 个 slot 时每个只有
         # 86.8MB，跑 DWD 的 6 表 join 不够；改成 4 个 slot 后每 slot 217MB。
         # slot 数不是"越多越好"，它就是内存切分粒度：作业少的时候降 slot 数，
         # 把内存集中给重作业；ODS 那种单流同步作业多的时候再调回 10。
@@ -242,7 +242,12 @@ services:
         #   的 double buffer + 网络缓冲申请，表现为 TM 抛 Java heap space
         #   整体重启（docker inspect RestartCount 涨 1），然后 07 的 4 个
         #   算子永远卡在 initializing —— 看起来 RUNNING，实际一行不写。
-        # 提到 3072m 后 taskHeap ≈ 2.2GB / 4 slot ≈ 550MB，留足余量。
+        # 当前 3072m 实测：taskHeap **1489MB** / 4 slot = **372MB**，是 join
+        # 状态（134MB）的 2.8 倍，够 checkpoint 的 double buffer 了。
+        # 这个 1489 是算出来的、也是实测对上的：
+        #   3072 − metaspace 256 − jvm overhead 307（10%） = 2509 total flink
+        #   2509 − managed 512 − network 256 − framework heap/offheap 各 128 = 1489
+        # 别再凭 process.size 的比例估 taskHeap，偏差能有 700MB。
         taskmanager.memory.process.size: 3072m
         taskmanager.memory.managed.size: 512m
         taskmanager.memory.network.min: 64m
@@ -338,7 +343,21 @@ services:
       timeout: 5s
       retries: 20
       start_period: 40s
-    mem_limit: ${DORIS_BE_MEM_LIMIT:-2560m}
+    # 2026-11-04 从 2560m 降到 1792m。同一天 TM 因 07 的 join 状态从 2560m
+    # 提到 3328m（+768m），BE 这边等量让出 768m —— **六容器合计仍是 8.75GB、
+    # WSL 10GB 里仍余 1.2GB**，只挪预算，不动上限。
+    #
+    # 敢降是因为量过，不是估的：
+    #   · 卷标称 9.6GB，其中 trash/ 占 9.1GB（历次 TRUNCATE 的垃圾），
+    #     活跃 data 只有 406MB —— BE 不需要为 9.6GB 预留 page cache
+    #   · Stream Load 的 MemTracker Peak 168MB（Doris sink 每 10s 一批）
+    #   · BE 按 cgroup × 0.9 算可用内存 → 1612MB；row cache 20% = 322MB、
+    #     inverted index 10% = 161MB，都是上限，这套表没建倒排索引
+    #
+    # 降完仍要盯的信号（不报错、只变慢的那种）：
+    #   be.WARNING 里 compaction 因内存不足被拒（-235 / compaction mem limit），
+    #   或某个 tablet 的 rowset 版本数持续上涨 —— 就是 11-03 那次读不动的先兆。
+    mem_limit: ${DORIS_BE_MEM_LIMIT:-1792m}
     networks:
       rt-net:
         ipv4_address: 172.28.0.11
