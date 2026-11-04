@@ -43,6 +43,8 @@ bash scripts/demo.sh --with-events
 
 不想开大屏只想把后端跑起来：`bash scripts/demo.sh --no-dashboard`。
 想验证端到端延迟：`python scripts/check_lag.py --write`（真采 200 条探针算 P99）。
+想验证「改一行真的会传到大屏」：`bash scripts/demo-change.sh`（先自检作业是否真在产出，
+再改一行、量出 DWS / ADS / 面板各自的时延、最后自动改回去）。
 
 ---
 

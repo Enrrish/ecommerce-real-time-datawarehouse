@@ -184,6 +184,15 @@ def _bash_exe() -> str:
 
 
 def _run_health_collect() -> None:
+    # MSYS_NO_PATHCONV=1 是给脚本里那些 `docker exec ... /opt/kafka/...` 用的：不加它，
+    # Git Bash 会把容器内的 POSIX 路径当成自己的路径去改写（详见 docs/04 的坑表）。
+    #
+    # 但它是个双刃剑，代价必须记住：这个开关同时**关掉了**「POSIX 路径 → Windows 路径」
+    # 的翻译。所以被它拉起的脚本里，不能再把 `/d/Users/...` 这种路径递给任何原生 Windows
+    # 程序（python.exe 首当其冲）——对方打不开，报 FileNotFoundError，如果错误又被
+    # 2>/dev/null 吞掉，就变成一个只在「从大屏调用」时才出现的静默降级。
+    # 真实案例：健康度的 e2e_latency_ms 因此长期回退到常量 3849，人工跑脚本却正常。
+    # 结论：flag 只用来保护 docker/容器路径，脚本内部别拿它当「通用安全设置」。
     env = dict(os.environ, MSYS_NO_PATHCONV="1")
     res = subprocess.run(
         [_bash_exe(), str(PROJECT / "scripts" / "collect-pipeline-health.sh")],

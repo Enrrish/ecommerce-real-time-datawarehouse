@@ -192,6 +192,68 @@ CKPT_P95=$(num_or "$(echo "$CKPT_LINE" | cut -f1)" 0)
 JOBS_RUNNING=$(num_or "$(echo "$CKPT_LINE" | cut -f2)" 0)
 CKPT_RECENT=$(num_or "$(echo "$CKPT_LINE" | cut -f3)" 0)
 
+# ---------------------------------------------------------------------------
+# 交易链 join 状态：07 四个源表的累计读取行数
+# ---------------------------------------------------------------------------
+# 为什么必须单独有这一个指标：
+#   上面那个 pipeline_freshness 是 **MIN** 口径（三张主表取最近者），而
+#   ads_realtime_overview 每 60 s 被批刷重写一次、update_time 跟着刷新。
+#   于是只要 ADS 还在刷，dws_trade_overview_1m 停多久都看不出来。
+#
+#   2026-11-04 08:49 就出过这个事：07 用 latest-offset 重启，join 的 orders 侧状态
+#   是空的，每条 order_items 变更都被 join 丢掉，sink 一行不写。而那一刻健康度
+#   10 项全 ok —— 作业 RUNNING、checkpoint 正常、Kafka lag 0、新鲜度 0 s。
+#   详见 flink/sql/07-dws-trade-overview-1m.sql 的文件头。
+#
+# 判据用「四个源累计读取 ≥ 40 万行」（快照实际是 41.5 万），因为它是 join 状态被
+# 填满的**直接证据**，且不依赖有没有新数据进来：静态数据集下这个数会一直停在那儿，
+# 不会因为「今天没人下单」误报红。
+#
+# 读不到 Flink REST 就**不写**这一项（空字符串 → 跳过），不写 0：
+# 写 0 会被读成「僵尸」，那是把「没测到」说成「测到了坏消息」，与 --skip-kafka
+# 的处理保持同一原则。作业确实不在 RUNNING 时才是真的 0。
+OVERVIEW_JOIN=$(flink "/jobs/overview" | python -c "
+import sys, json, subprocess
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+jid = ''
+for j in d.get('jobs', []):
+    if j.get('state') == 'RUNNING' and 'sink_dws_trade_overview_1m' in (j.get('name') or ''):
+        jid = j['jid']
+        break
+if not jid:
+    print(0)
+    sys.exit(0)
+
+def get(url):
+    r = subprocess.run(['docker', 'exec', 'rt-flink-jm', 'curl', '-s', url],
+                       capture_output=True, text=True, timeout=20)
+    return json.loads(r.stdout)
+
+try:
+    vs = [v['id'] for v in get('http://localhost:8081/jobs/%s' % jid).get('vertices', [])
+          if (v.get('name') or '').startswith('Source:')]
+except Exception:
+    sys.exit(0)
+total = 0
+for v in vs:
+    idx = ','.join('%d.numRecordsOut' % i for i in range(8))
+    try:
+        total += sum(int(x['value']) for x in
+                     get('http://localhost:8081/jobs/%s/vertices/%s/metrics?get=%s' % (jid, v, idx)))
+    except Exception:
+        sys.exit(0)
+print(total)
+" 2>/dev/null)
+
+OVERVIEW_LEVEL=ok
+if [[ -n "$OVERVIEW_JOIN" && "$OVERVIEW_JOIN" -lt 400000 ]]; then
+  OVERVIEW_LEVEL=critical
+fi
+
+
 echo "==> 采集 Kafka 侧指标"
 KAFKA_LAG=0
 DUP_RATE=0
@@ -287,25 +349,51 @@ fi
 # 端到端延迟：优先用 check_lag.py 的实测 P99，没有则退回 P3 的历史基线。
 # 阈值跟着架构走 —— sink 的 buffer-flush.interval 是 10s，任何测量都不可能低于它，
 # 所以「5000ms 就算慢」是错的阈值：它会把一个设计正常的链路永久标黄。
+#
+# 为什么用 sed 读 JSON 而不是 python -c：大屏进程用 MSYS_NO_PATHCONV=1 拉起本脚本
+# （为了让 `docker exec ... /opt/kafka/...` 里的容器内路径不被 Git Bash 改写），而这个
+# 开关同时关掉了「POSIX 路径 → Windows 路径」的翻译。于是 `python -c ... "/d/Users/..."`
+# 把一个原生 Windows 程序打不开的路径递给了它，抛 FileNotFoundError，又被 2>/dev/null
+# 吞掉，E2E 静默退回 3849 —— 同一条脚本人工跑正常、大屏跑降级，两边看到不同的数。
+# 改成不起解释器，路径形态 / 解释器有无 / 文件编码这三个依赖一起消失。
 LATENCY_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.latency.json"
-E2E_LINE=""
+
+json_num() {  # $1=键名 $2=文件（只取第一条匹配，值必须是裸数字）
+  sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9.]*\).*/\1/p' "$2" 2>/dev/null \
+    | sed -n '1p'
+}
+json_str() {  # $1=键名 $2=文件（取字符串值）
+  sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$2" 2>/dev/null \
+    | sed -n '1p'
+}
+
+E2E_MEASURED=0
+E2E_SAMPLES=0
+E2E_AT="?"
 if [[ -f "$LATENCY_FILE" ]]; then
-  E2E_LINE=$(python -c "
-import json, sys
-d = json.load(open(sys.argv[1], encoding='utf-8'))
-print('%d\t%d\t%s' % (round(d.get('p99') or 0), d.get('samples') or 0,
-                      d.get('measured_at') or '?'))
-" "$LATENCY_FILE" 2>/dev/null || true)
+  E2E_MEASURED=$(num_or "$(json_num p99 "$LATENCY_FILE")" 0)
+  # 取整：JSON 里 p99 是 10034.6 这种浮点，而 `[[ x -le 0 ]]` 只认整数，
+  # 直接比会报 "invalid arithmetic operator"。以前是 python round() 之后才落到 bash，
+  # 换成 sed 读之后这层保证没了。
+  E2E_MEASURED=$(awk -v v="$E2E_MEASURED" 'BEGIN{if (v ~ /^-?[0-9.]+$/) printf "%d", (v < 0 ? v - 0.5 : v + 0.5); else print 0}')
+  E2E_SAMPLES=$(num_or "$(json_num samples "$LATENCY_FILE")" 0)
+  E2E_AT=$(json_str measured_at "$LATENCY_FILE")
+  [[ -n "$E2E_AT" ]] || E2E_AT="?"
+  # 文件在但读不出数字 = 格式坏了，不能装作「没测过」，得说出来
+  if [[ "$E2E_MEASURED" -le 0 ]]; then
+    echo "    ⚠ $LATENCY_FILE 存在但读不出 p99，按未测量处理"
+  fi
 fi
-E2E_MEASURED=$(num_or "$(echo "$E2E_LINE" | cut -f1)" 0)
+
 if [[ "$E2E_MEASURED" -gt 0 ]]; then
   E2E_MS="$E2E_MEASURED"
-  E2E_SAMPLES=$(num_or "$(echo "$E2E_LINE" | cut -f2)" 0)
-  E2E_AT=$(num_or "$(echo "$E2E_LINE" | cut -f3)" "?")
   E2E_DESC="kafka→doris 实测 P99（N=$E2E_SAMPLES，采于 $E2E_AT）。**下限是 sink flush 间隔 10s**，<12000 ok / <20000 warn"
 else
   E2E_MS=3849
   E2E_DESC="P3 单次实测基线 **不是 P99**；跑 scripts/check_lag.py --write 换成实测值。<5000 ok / <15000 warn"
+  # 退回历史基线这件事必须自己说出来。它沉默过一次：大屏进程每次都在静默改写这个值，
+  # 面板上显示 3849ms「很健康」，实际 P99 是 10035ms。
+  echo "    ⚠ 未读到 $LATENCY_FILE，端到端延迟退回 P3 历史基线 3849ms（跑 check_lag.py --write 更新）"
 fi
 E2E_LEVEL=$(level_of 12000 20000 "$E2E_MS")
 
@@ -322,6 +410,17 @@ echo "==> 写入 ads_pipeline_health"
 # 写 0 会被读成「零重复、零积压」，又是一个「没测量却报好消息」的假象。
 # 没采就不写，让它保留上一次的值 —— 面板上看到的是「上次采集」的数字，
 # 而不是一个凭空捏造的 0。
+#
+# overview_join_rows 同理：Flink REST 读不到就不写这一行（见上面那段注释）。
+EXTRA_ROW=""
+if [[ -n "$OVERVIEW_JOIN" ]]; then
+  # threshold_desc 是 varchar(255) 且按**字节**算（中文 3 字节/字），这条说明必须
+  # 压在 255 字节内 —— 超了 Doris strict mode 会整条 INSERT 拒掉，报
+  # 「Insert has filtered data in strict mode」而**不带列名**，很容易误判成统计问题。
+  EXTRA_ROW=",
+  ('overview_join_rows','交易链 join 行数', $OVERVIEW_JOIN, '行', '$OVERVIEW_LEVEL',
+   '07 四个源累计读取行数，join 状态已填满的直接证据。**唯一能发现「作业 RUNNING 却一行不写」的指标**。≥40 万 ok；低于=快照未完或 latest-offset 僵尸', 'capacity', NOW())"
+fi
 MSYS_NO_PATHCONV=1 docker exec -i rt-doris-fe mysql -h127.0.0.1 -P9030 -uroot -D realtime_dw -e "
 INSERT INTO ads_pipeline_health
   (metric_key, metric_name, metric_value, metric_unit, metric_level, threshold_desc, metric_group, collect_time)
@@ -329,7 +428,7 @@ VALUES
   ('e2e_latency_ms',    '端到端延迟',      $E2E_MS,         'ms',  '$E2E_LEVEL',
    '$E2E_DESC', 'delay',   NOW()),
   ('pipeline_freshness_s','管道新鲜度',    $FRESHNESS,      's',   '$FRESH_LEVEL',
-   '最近一次成功写入距今。反映链路是否还活着。<300 ok / <3600 warn', 'delay',   NOW()),
+   '三张主表 update_time 取**最近**者（MIN）：任一条链在写就算活。它**不能**证明每条链都在写 —— 交易链要看 overview_join_rows。<300 ok / <3600 warn', 'delay',   NOW()),
   ('event_age_p99_s',   '事件年龄 P99',    $EVENT_AGE_P99,  's',   '$EVENT_AGE_LEVEL',
    '$EVENT_AGE_DESC', 'quality', NOW()),
   ('canceled_gmv',      '无效交易金额',    $CANCELED_GMV,   '元',  '$CANCEL_LEVEL',
@@ -339,7 +438,7 @@ VALUES
   ('checkpoint_p95_ms', 'Checkpoint P95',  $CKPT_P95,       'ms',  '$CKPT_LEVEL',
    '运行中作业最近 10 次已完成 checkpoint 的 P95（history 口径，不是全生命周期 summary）。$CKPT_RECENT 个作业样本足够。<5000 ok / <15000 warn', 'capacity', NOW()),
   ('flink_jobs_running','运行中作业数',    $JOBS_RUNNING,   '个',  'ok',
-   '状态为 RUNNING 的 Flink 作业数。4 slots 集群期望 3-4 个', 'capacity', NOW());
+   '状态为 RUNNING 的 Flink 作业数。4 slots 集群期望 3-4 个', 'capacity', NOW())$EXTRA_ROW;
 " 2>&1 | head -5
 
 if [[ "$SKIP_KAFKA" -eq 0 ]]; then

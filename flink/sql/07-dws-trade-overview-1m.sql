@@ -5,13 +5,38 @@
 -- 目标：realtime_dw.dws_trade_overview_1m
 -- server-id：5561-5576（ODS 5401-5484，P4 DWD 5531-5558，本作业 5561 起）
 --
--- scan.startup.mode = 'latest-offset'（P7 起）：
+-- scan.startup.mode = 'initial'（P8 改回，理由见下）：
 --   本作业是唯一保留的 mysql-cdc 直读作业（ODS 那 9 个已停，见 docs/04）。
---   首次从零搭建时历史数据靠它做 initial 快照，但**重启**时没必要重放
---   155 万行 —— 一是慢几分钟，二是聚合状态要从零重建，4 slot / 217MB
---   的 taskHeap 扛不住。改成 latest-offset 后重启即秒起，历史行原地保留
---   （目标表是 UNIQUE KEY 模型，不写就不会丢）。
---   若需重建全量：把 4 处都改回 'initial' 再提交。
+--
+--   P7 曾改成 'latest-offset'，动机是「重启时不必重放历史、聚合状态不必从零重建，
+--   秒起」。这个判断错了一半，而且错得很贵 ——
+--
+--   关键事实：本作业的 4 张源表不是各自独立聚合，而是 **join 之后再聚合**
+--   （order_items ⋈ orders ⋈ customers ⋈ payment_agg）。正常 join 的两侧状态
+--   都只来自数据流：没有快照，就没有 orders / customers 侧的行。
+--   而 `latest-offset` 意味着重启后从当前位点开始，一条历史行都不读。
+--   于是 join 的一侧永远是空的 —— 每来一条 order_items 变更，都因为「找不到
+--   对应订单」被 join 直接丢掉，sink 一条也发不出去。
+--
+--   实测现场（2026-11-04 08:49，BE 崩完重提后）：
+--     src_order_items 源 numRecordsOut = 2   （改了 1 行 → -U/+U 两条）
+--     Join[6]          numRecordsIn = 2, numRecordsOut = 0
+--     sink             numRecordsIn = 0
+--   而作业状态是 **RUNNING**、checkpoint 正常、lag 0、健康度 10 项全 ok。
+--   目标表 8.8 万行还静静地躺在那儿，KPI 也照旧显示 —— 面板上完全看不出来。
+--   这就是「UNIQUE 表不写就不会丢」这句话的陷阱：它保证了数据不丢，
+--   同时也保证了你**永远发现不了它已经不写了**。
+--
+--   成本重估：注释里原先写「重放 155 万行」是按整个 ODS 层算的，本作业只读
+--   4 张表 —— orders 9.9 万 + order_items 11.3 万 + customers 9.6 万
+--   + order_payments 10.4 万 ≈ **41 万行**，实测快照 1~2 分钟。
+--   用这 1~2 分钟换「重启后自愈」，比换「秒起但永久僵尸」划算得多。
+--
+--   代价要说清：每次重启都要重跑一遍快照，聚合状态要从 41 万行重建，
+--   4 slot / 217MB 的 taskHeap 是够的（首次搭建就是这么建起来的），
+--   但重启后必须等快照跑完再验收，别看到 RUNNING 就以为好了。
+--   若确实只要「快起不要自愈」（例如纯演示环境），把 4 处都改回
+--   'latest-offset'，但要接受：**重提之后本作业不会再产出任何一行**。
 --
 -- =============================================================================
 -- 为什么一个作业只做一张 DWS 表（这是实测撞出来的，不是设计偏好）
@@ -89,7 +114,7 @@ CREATE TABLE src_orders (
   'server-id'                    = '5561-5564',
   'server-time-zone'             = 'Asia/Shanghai',
   'scan.incremental.snapshot.chunk.size' = '200000',
-  'scan.startup.mode' = 'latest-offset'
+  'scan.startup.mode' = 'initial'
 );
 
 
@@ -113,7 +138,7 @@ CREATE TABLE src_order_items (
   'server-id'                    = '5565-5568',
   'server-time-zone'             = 'Asia/Shanghai',
   'scan.incremental.snapshot.chunk.size' = '200000',
-  'scan.startup.mode' = 'latest-offset'
+  'scan.startup.mode' = 'initial'
 );
 
 
@@ -135,7 +160,7 @@ CREATE TABLE src_customers (
   'server-id'                    = '5569-5572',
   'server-time-zone'             = 'Asia/Shanghai',
   'scan.incremental.snapshot.chunk.size' = '200000',
-  'scan.startup.mode' = 'latest-offset'
+  'scan.startup.mode' = 'initial'
 );
 
 
@@ -158,7 +183,7 @@ CREATE TABLE src_order_payments (
   'server-id'                    = '5573-5576',
   'server-time-zone'             = 'Asia/Shanghai',
   'scan.incremental.snapshot.chunk.size' = '200000',
-  'scan.startup.mode' = 'latest-offset'
+  'scan.startup.mode' = 'initial'
 );
 
 

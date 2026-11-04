@@ -12,6 +12,7 @@ scripts/
 ├── fetch-flink-jars.sh   # 下载 4 个 connector jar（含 MySQL JDBC 驱动）
 ├── submit-sql.sh         # 提交 Flink SQL 作业并打印运行状态
 ├── collect-pipeline-health.sh  # 采集链路健康度 → ads_pipeline_health
+├── demo-change.sh        # 改一行 MySQL，量出它走到大屏要多久（含僵尸自检）
 └── check_lag.py          # 端到端延迟真采样 → P50/P95/P99
 ```
 
@@ -181,7 +182,7 @@ bash scripts/submit-sql.sh flink/sql/01-ods-orders.sql
 
 ## `collect-pipeline-health.sh`
 
-采集 10 个链路指标写入 `ads_pipeline_health`，供大屏健康度面板读取。
+采集 11 个链路指标写入 `ads_pipeline_health`，供大屏健康度面板读取。
 
 ```bash
 bash scripts/collect-pipeline-health.sh              # 全量采集（约 30-40s）
@@ -207,9 +208,32 @@ CDC 作业初始快照期间 checkpoint 会被拖到十几秒，这历史一旦�
 实测一个已经平稳跑了几小时的作业仍然报 **19,095ms** 并常亮 critical。
 现在改成从 `history` 里取最近 10 次 COMPLETED 自己算 P95。
 
+**③ `pipeline_freshness_s` 是 MIN 口径，它证明不了每条链都在写。** 三张主表
+（`dws_trade_overview_1m` / `dwd_user_event_clean` / `ads_realtime_overview`）取
+`update_time` 的最近者，只要有一条链在写，这个值就是 0~几秒。而
+`ads_realtime_overview` 每 60 秒被批刷重写一次、`update_time` 跟着刷新 —— 于是
+**交易链停多久都看不出来**。
+
+真实现场（2026-11-04 08:49）：07 用 `latest-offset` 重启，join 的 orders 侧状态是空的，
+每条 `order_items` 变更都因为「找不到订单」被丢掉，sink 一行不写。那一刻健康度
+10 项全 `ok` —— 作业 RUNNING、checkpoint 正常、lag 0、新鲜度 0 s，大屏照旧显示昨天的数字。
+
+补的第 11 项 `overview_join_rows`（07 四个源累计读取行数，实测 415,426）是 join 状态
+被填满的**直接证据**，也是目前唯一能发现这件事的指标。它不随「有没有新数据」变化，
+所以静态数据集下不会误报；判据 `≥40 万 ok`，低于多半是快照没跑完（等 1~2 分钟）
+或用 `latest-offset` 重启后成了僵尸（改回 `initial` 重提）。读不到 Flink REST 时
+这一项**不写**，不是写 0。
+
+**④ 别在 `MSYS_NO_PATHCONV=1` 下面起解释器读绝对路径。** 大屏进程用这个开关拉起本脚本
+（它保护 `docker exec ... /opt/kafka/...` 里的容器内路径不被 Git Bash 改写），代价是
+**同时关掉了「POSIX 路径 → Windows 路径」的翻译**：`python -c ... "/d/Users/..."` 把一个
+原生 Windows 程序打不开的路径递了过去，`FileNotFoundError` 又被 `2>/dev/null` 吞掉，
+`e2e_latency_ms` 静默退回常量 3849。于是**人工跑脚本正常、大屏跑降级**，两边看到的数不一样，
+而且退回去的那个值看着还很健康。现在读 `.latency.json` 改用 `sed`，不起解释器，
+路径形态 / 解释器有无 / 文件编码三个依赖一起消失，退回基线时也会打一行显式警告。
+
 **质量指标的口径是这张表最容易做错的地方。** `dup_rate` / `late_ratio` 用
 「最近 N 条滑动窗口 + 跨分区均分」，实测试了三次才对：
-
 | 口径 | 测出值（真实注入 3%） | 为什么错 |
 | --- | --- | --- |
 | 全 topic 累计 | 0.19% | 60 条重复被 2 万条历史稀释 15 倍 |
@@ -277,3 +301,53 @@ python scripts/check_lag.py --write      # 把 P99 写回 ads_pipeline_health
 已知偏差：轮询粒度 100ms（每个样本 +0~100ms）；sink 的 `buffer-flush.interval = 10s`
 是**架构下限**，所以 P99 在 10s 附近是正常的 —— 想压到秒级只能改 flush 间隔，
 而 1s 会把 Doris 版本打爆（见 `flink/sql/06` 的注释）。
+
+## `demo-change.sh`
+
+改一行 MySQL，量出它走到大屏要多久。这是「这个项目真的是实时的」最直接的一个证据 ——
+不是看链路图，是看一个数字因为一次 `UPDATE` 变了。
+
+```bash
+bash scripts/demo-change.sh              # 默认 +1000.00，改完自动改回去
+bash scripts/demo-change.sh --delta 500  # 换个幅度
+bash scripts/demo-change.sh --keep       # 故意不回滚
+```
+
+一次运行的实测输出（P8）：
+
+```
+==> 0. 自检（作业存活 + 快照已灌满 join 状态）
+  ✓ 07 作业 fd043ef8 RUNNING
+  ✓ 四个源累计读取 415422 行（快照已完成，join 状态可用）
+
+==> 1. 选目标行
+    数据日   2017-11-24
+    订单     27db1a079a22bec1…  明细 #1  分钟桶 01:34
+    价格     2400.00 → 3400.00（+1000.00）
+
+==> 4. 观测传播
+    DWS           3724 ms   178377.63 → 179377.63
+    ADS          10655 ms   178377.63 → 179377.63
+    大屏        1254 ms   178377.63 → 179377.63
+    端到端（改 MySQL → 大屏可见）17303 ms
+```
+
+三个观测点慢的原因完全不同，别混着看：
+
+| 观测点 | 实测 | 时间花在哪 |
+| --- | --- | --- |
+| DWS | 1.4 ~ 3.7 s | binlog → CDC → 三表 join → 分钟聚合 → Doris sink（07 的 flush 是 1 s） |
+| ADS | 10 ~ 57 s | `ads_realtime_overview` 是 60 s 一轮的**批刷**，撞在周期哪个位置全看运气 |
+| 大屏 | ≈ ADS + 1.2 s | 面板 1 s 一轮轮询 API |
+
+所以「端到端十几秒到一分钟」的主体是批刷周期，不是 Flink 慢。想让面板更快，
+该调的是 `dashboard/server/app.py` 里 full 档的 period，不是并行度。
+
+**第 0 步的自检比演示本身更重要。** 这张表上出过两次「作业 RUNNING 但一行不写」，
+两次都没有报错：`latest-offset` 重启后 join 状态为空、`initial` 重启后快照没跑完。
+这两种情况下直接改数据会得到「什么都没发生」，而人几乎一定会把它理解成
+「链路慢」或者「改动没生效」。所以脚本先确认四个源已累计读满 40 万行，
+不到就直接报错退出，不去动那行 MySQL。
+
+**回滚是有保障的**：`trap ... EXIT INT TERM` 会在任何退出路径上把 `price` 改回原值，
+包括 Ctrl-C。`--keep` 是唯一不回滚的入口，且会明确提示当前值是脏的。
