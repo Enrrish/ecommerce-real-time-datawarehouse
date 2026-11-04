@@ -48,6 +48,24 @@ if [ "$MODE" = "snapshot" ]; then
   exit 0
 fi
 
+# --- 端口自检：重复启动会静默多开一个实例 -----------------------------------
+# Windows 下两个 server/app.py 能同时绑上 8080（SO_REUSEADDR），两个都显示
+# LISTENING，谁也不报错。后果是「刷新一次好一次坏」——连接随机落到其中
+# 一个进程，而两个进程可能是用两个不同的 Python 起的（PATH 变了），
+# 各自缓存着不同时期的模块。这类问题查起来极其费时，所以在入口挡掉。
+if python -c "
+import socket, sys
+s = socket.socket(); s.settimeout(1.5)
+sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)
+" 2>/dev/null; then
+  echo "✗ 端口 $PORT 上已经有一个实例在跑，本次启动已取消。" >&2
+  echo "  先停掉它：在它的终端按 Ctrl+C，或查 PID 后结束进程：" >&2
+  echo "    netstat -ano | grep :$PORT" >&2
+  echo "  重复启动不会报错，只会在同一端口上再挂一个，两个实例抢连接、" >&2
+  echo "  各自返回自己那份缓存的文件 —— 表现就是「刷新一次好一次坏」。" >&2
+  exit 1
+fi
+
 echo "=================================================================="
 echo " Olist 实时经营指挥台"
 echo "   页面   http://127.0.0.1:${PORT}/"

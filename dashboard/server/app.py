@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -244,6 +245,38 @@ def start_refreshers() -> None:
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
+# index.html 里对 src/*.js|css 的引用，返回前统一追加 ?v=<mtime>。
+#
+# 为什么非加不可：浏览器对没有 Cache-Control 的静态文件走「启发式缓存」，
+# 通常取「Last-Modified 距今时长的 10%」当新鲜期。改完前端立刻刷新时，
+# 它很可能直接复用旧 JS 而不发条件请求。旧 JS 去操作新 HTML 里已经删掉的
+# 元素 id（这次是 #todayGmv 改成了 #todayText），getElementById 返回 None，
+# 一次 .textContent 赋值就抛 TypeError，render() 从那一行断掉 ——
+# 8 个面板全停在初始的「加载中…」，顶栏却只是「数据延迟」，看起来像后端挂了。
+#
+# 这个 bug 有个恶劣的性质：只有「刚改完前端且浏览器有旧缓存」的那个人能看到。
+# 无头浏览器每次是全新上下文，开发时永远复现不出来。所以不能靠「记得强刷」，
+# 得让 URL 跟着文件走 —— 文件一改，URL 就变，缓存天然失效。
+_ASSET_REF = re.compile(r'(src|href)="(src/[^"?#]+)"')
+
+
+def _index_html() -> bytes:
+    try:
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+    except OSError:
+        return b""
+
+    def stamp(m: re.Match) -> str:
+        attr, rel = m.group(1), m.group(2)
+        try:
+            ver = int((ROOT / rel).stat().st_mtime)
+        except OSError:
+            ver = 0
+        return f'{attr}="{rel}?v={ver}"'
+
+    return _ASSET_REF.sub(stamp, html).encode("utf-8")
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=str(ROOT), **kw)
@@ -257,18 +290,50 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._no_store = True                    # 见 end_headers，别加两遍
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
+    def end_headers(self) -> None:
+        # 静态资源（index.html / src/*.js / src/*.css）必须禁缓存。
+        #
+        # 标准库 SimpleHTTPRequestHandler 只发 Last-Modified，不发 Cache-Control，
+        # 浏览器于是走「启发式缓存」——通常取距今时间的 10% 当新鲜期。改完前端
+        # 立刻刷新时，浏览器很可能直接复用旧 JS 而不发条件请求。
+        #
+        # 后果不是「样式没更新」这么轻：新旧混搭会让 getElementById 返回 null。
+        # 曾经改版删掉 #todayGmv（换成 #todayText）、JS 也同步改了，但浏览器拿
+        # 的是旧 JS —— 它在 null 上取 .textContent 抛 TypeError，render() 从那一行
+        # 断掉，8 个面板全部停在初始的「加载中…」，而顶栏仍是「数据延迟」。
+        # 看起来像后端挂了，实际后端 200 且数据齐全，只有刷新页面的那个人能看到。
+        if not getattr(self, "_no_store", False):
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
+
     def do_GET(self):                            # noqa: N802 - 标准库命名
-        if self.path.startswith("/api/dashboard"):
+        path = (self.path or "/").split("?")[0]  # ?once=1 之类不能影响路由
+        if path.startswith("/api/dashboard"):
             return self._dashboard()
-        if self.path.startswith("/api/ping"):
+        if path.startswith("/api/ping"):
             return self._json({"ok": True, "ts": time.time()})
-        if self.path.startswith("/health"):
+        if path.startswith("/health"):
             return self._json(self._health())
+        if path in ("/", "/index.html"):
+            return self._index()
         return super().do_GET()
+
+    def _index(self) -> None:
+        body = _index_html()
+        if not body:                             # 读不到就退回标准库，别 500
+            return super().do_GET()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _dashboard(self) -> None:
         t0 = time.time()
