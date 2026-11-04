@@ -28,11 +28,15 @@
 
     <div class="header-right">
       <span class="pill" id="linkPill"><i class="dot"></i><span id="linkText">链路正常</span></span>
-      <span class="pill live" id="todayPill" title="今日实时（改一行 MySQL 5 秒内会在这里变）">
-        <i class="dot"></i>今日 <b id="todayGmv">—</b>
-        <span class="sep">·</span><span id="todayOrders">—</span> 单
+      <!-- 这一格是交易链路（MySQL binlog），和左边「实时转化漏斗」（Kafka 埋点）
+           是两套数据源、两条时间轴。往 orders 表插/改一行，5 秒内变的是这里；
+           埋点上报多少 pay 事件都不会影响它 —— 埋点不写订单表。 -->
+      <span class="pill live" id="todayPill"
+            title="今日成交 · 来自 MySQL binlog → Flink CDC 的订单口径。和左侧漏斗不是同一条链路：漏斗是 Kafka 行为埋点，上报 pay 事件不写订单表。Olist 数据止于 2018-09-03，今天没有订单时显示「暂无」；往 orders 插一行就会立刻跳数。">
+        <i class="dot"></i><span id="todayText">今日成交 —</span>
+        <span class="src" title="数据源：MySQL CDC">CDC</span>
       </span>
-      <span class="pill" id="datePill">数据日 —</span>
+      <span class="pill" id="datePill">交易日 —</span>
       <div style="display:flex;align-items:center;gap:8px">
         <span style="font-size:11px;color:#4C5B69;letter-spacing:.4px">刷新倒计时</span>
         <div class="tick"><i id="tickBar"></i></div>
@@ -49,9 +53,15 @@
     <div class="panel">
       <div class="panel-head">
         <span class="panel-title">实时转化漏斗</span>
-        <span class="panel-note" id="funnelNote">昨日数据</span>
+        <span class="panel-note" id="funnelNote">行为流 —</span>
       </div>
       <div class="panel-body" id="pFunnel"><div class="empty">加载中…</div></div>
+      <!-- 这一行是这张图最容易被误读的地方：漏斗的「支付」是行为，不是成交。
+           它既不写 orders 表，也不产生 GMV —— 所以它能一直涨而右侧流水不动。 -->
+      <div class="panel-foot">
+        行为流口径：「支付」= 上报 <code>pay</code> 事件的人次<br>
+        不写订单表、不产生 GMV，与下方交易面板非同源
+      </div>
     </div>
 
     <div class="panel">
@@ -88,7 +98,7 @@
     <div class="panel">
       <div class="panel-head">
         <span class="panel-title">支付方式分布</span>
-        <span class="panel-note">按支付笔数</span>
+        <span class="panel-note">按支付笔数 · 交易日</span>
       </div>
       <div class="panel-body" id="pPayment"><div class="empty">加载中…</div></div>
     </div>
@@ -96,9 +106,9 @@
     <div class="panel">
       <div class="panel-head">
         <span class="panel-title">实时订单流水</span>
-        <span class="panel-note" style="display:flex;align-items:center;gap:6px">
+        <span class="panel-note" id="ordersNote" style="display:flex;align-items:center;gap:6px">
           <i style="width:6px;height:6px;border-radius:50%;background:#FF6A55;
-                    box-shadow:0 0 8px #FF6A55"></i>LIVE · 最近 8 笔
+                    box-shadow:0 0 8px #FF6A55"></i>CDC 入库 · 最近 8 笔 · 至 <span id="ordersDate">—</span>
         </span>
       </div>
       <div class="panel-body" id="pOrders"><div class="empty">加载中…</div></div>

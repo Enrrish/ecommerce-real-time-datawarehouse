@@ -30,7 +30,9 @@ const KPI_DEFS = [
     foot: (d) => deltaFoot(d.kpi.gmv, d.kpi.prev_gmv, '较前一日'),
   },
   {
-    label: '支付订单数',
+    // 叫「成交订单数」而不是「支付订单数」：漏斗那边有个「完成支付」，
+    // 两者一个是 2017 黑五的 MySQL 成交、一个是今天的行为埋点，撞词就会被当成同一件事。
+    label: '成交订单数',
     value: (d) => fmtMoney(d.kpi.orders, 0),
     foot: (d) => deltaFoot(d.kpi.orders, d.kpi.prev_orders, '较前一日'),
   },
@@ -104,26 +106,33 @@ function render(d) {
 
   // 顶栏
   document.getElementById('datePill').textContent =
-    `数据日 ${meta.data_date || '—'}`;
+    `交易日 ${meta.data_date || '—'}`;
+  // 「行为流」三个字必须留着：这张图的日期是 2026，而旁边所有交易面板是 2017-2018。
+  // 只写「埋点 2026-11-04」时，读数的人会把两个时间轴当成同一个。
   document.getElementById('funnelNote').textContent =
-    `埋点 ${meta.funnel_date || '—'}`;
-  document.getElementById('catNote').textContent = meta.data_date || '';
+    `行为流 · ${meta.funnel_date || '—'}`;
+  document.getElementById('catNote').textContent =
+    `交易日 ${meta.data_date || '—'}`;
   document.getElementById('mapNote').textContent =
-    `${(d.map || []).length} / 27 州有成交`;
+    `交易日 · ${(d.map || []).length} / 27 州`;
+  document.getElementById('ordersDate').textContent = meta.latest_trade_date || '—';
   document.getElementById('clock').textContent = (meta.server_ts || '').slice(11) || '--:--:--';
 
-  // 今日实时：唯一不按展示日取的口径。改一行 MySQL，变的是这里。
+  // 今日成交：唯一不按展示日取的口径，读的是 MySQL CDC 交易链路。
+  // minutes=0 表示今天这个分区一行都没有 —— 显示 ¥0.00 会被读成「今天卖了个 0」，
+  // 实际是「数据源里没有今天」，所以用「暂无」把两种情况分开。
+  // 注意它和左侧漏斗无关：埋点上报 pay 事件不写 orders 表，这里永远不会跟着涨。
   const live = d.today || {};
-  const gmvEl = document.getElementById('todayGmv');
-  const ordEl = document.getElementById('todayOrders');
-  const gmvTxt = live.gmv == null ? '—' : '¥' + fmtMoney(live.gmv, 2);
-  if (gmvEl.textContent !== gmvTxt) {
-    gmvEl.textContent = gmvTxt;
-    gmvEl.classList.remove('flash');
-    void gmvEl.offsetWidth;
-    gmvEl.classList.add('flash');
+  const liveTxt = Number(live.minutes || 0) > 0 && live.gmv != null
+    ? `今日成交 ¥${fmtMoney(live.gmv, 2)} · ${fmtMoney(live.orders, 0)} 单`
+    : '今日成交 暂无';
+  const liveEl = document.getElementById('todayText');
+  if (liveEl.textContent !== liveTxt) {
+    liveEl.textContent = liveTxt;
+    liveEl.classList.remove('flash');
+    void liveEl.offsetWidth;
+    liveEl.classList.add('flash');
   }
-  ordEl.textContent = live.orders == null ? '—' : fmtMoney(live.orders, 0);
 
   renderKpi(d);
   funnelChart(document.getElementById('pFunnel'), d.funnel);

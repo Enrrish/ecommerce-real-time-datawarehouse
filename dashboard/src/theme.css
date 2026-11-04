@@ -154,6 +154,20 @@ header {
 .pill.live b { font-weight: 600; letter-spacing: 0.2px; }
 .pill.live .sep { color: #3A4753; }
 
+/* 数据源角标：把「这一格读的是哪条链路」写在数字旁边，而不是只写在 tooltip 里。
+   大屏上有两条互不相干的时间轴（交易 2017-2018 / 埋点 2026），不标出来就会被
+   当成同一个口径来读 —— 典型的误读是「漏斗有人支付，为什么订单不涨」。 */
+.pill .src {
+  font-size: 9.5px;
+  line-height: 1;
+  letter-spacing: 0.7px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  border: 1px solid rgba(53, 214, 232, 0.26);
+  color: rgba(53, 214, 232, 0.78);
+  background: rgba(53, 214, 232, 0.06);
+}
+
 @keyframes livePulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.35; }
@@ -307,6 +321,28 @@ header {
 /* SVG 默认是行内元素，底部会留出基线间隙（约 4~6px）。这点间隙足以让
    「画满整个容器」的图表比容器高，触发栅格行反复增高。全部按块级渲染。 */
 .panel-body svg { display: block; }
+
+/* 面板脚注：常驻在 body 下方，用来交代「这张图量的是什么」。
+   flex:0 0 auto + body 的 flex:1/min-height:0，高度只从 body 借，不会撑开面板。
+   注意别把脚注写得比 body 的剩余空间还高 —— body 是 overflow:hidden，
+   挤掉的是图表底部（漏斗的话正好是「支付」那一行）。 */
+.panel-foot {
+  flex: 0 0 auto;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(255, 255, 255, 0.045);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  letter-spacing: 0.15px;
+  overflow: hidden;
+}
+.panel-foot code {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: #7BEAF7;
+  padding: 0 2px;
+}
 
 /* 双行：漏斗 / 趋势 / 品类 / 地图 */
 .row-a { display: grid; grid-template-columns: 352fr 636fr 372fr 420fr; gap: var(--gap); }

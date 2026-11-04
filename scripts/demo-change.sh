@@ -131,7 +131,7 @@ DATA_DATE=$(curl -s -m 8 http://localhost:8080/api/dashboard | python -c "
 import json,sys
 print(json.load(sys.stdin)['meta']['data_date'])" 2>/dev/null)
 [[ -n "$DATA_DATE" ]] || DATA_DATE=$(doris "SELECT MAX(dt) FROM ads_realtime_overview")
-[[ -n "$DATA_DATE" ]] || die "取不到大屏的数据日期"
+[[ -n "$DATA_DATE" ]] || die "取不到大屏的交易日"
 
 ROW=$(olist "SELECT oi.order_id, oi.order_item_id, oi.price, oi.freight_value,
                     DATE_FORMAT(o.order_purchase_timestamp, '%H:%i')
@@ -148,7 +148,7 @@ MINUTE=$(echo "$ROW" | cut -f5)
 
 NEW_PRICE=$(awk -v a="$ORIG_PRICE" -v d="$DELTA" 'BEGIN{printf "%.2f", a + d}')
 
-printf '    数据日   %s\n' "$DATA_DATE"
+printf '    交易日   %s\n' "$DATA_DATE"
 printf '    订单     %s  明细 #%s  分钟桶 %s\n' "${ORDER_ID:0:16}…" "$ITEM_ID" "$MINUTE"
 printf '    价格     %s → %s（%+.2f）\n' "$ORIG_PRICE" "$NEW_PRICE" "$DELTA"
 
