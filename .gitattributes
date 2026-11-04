@@ -10,6 +10,10 @@
 *.md      text eol=lf
 *.json    text eol=lf
 *.env*    text eol=lf
+# be.conf 是被 start_be.sh 逐行 source 的，CRLF 会让每个值尾部带上 \r
+# （`trash_file_expire_time_sec = 3600\r`）。本地 autocrlf=true 时
+# 若不锁 LF，别人 clone 下来就是坏的配置，且报错不会指向换行符。
+*.conf    text eol=lf
 Dockerfile text eol=lf
 
 # Windows 批处理保留 CRLF
