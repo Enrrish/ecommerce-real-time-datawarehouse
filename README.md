@@ -8,7 +8,7 @@
 
 ---
 
-## 0. 快速开始（5 条命令）
+## 0. 快速开始（6 条命令：跑起来 5 条，关掉 1 条）
 
 前置：Docker Desktop 已启动（WSL2 后端，内存上限 10GB）；`data/raw/olist/` 下已放好 9 个 CSV
 （下载方式见 [data/README.md](data/README.md)）。首次跑要拉 11.6GB 镜像，约 25 分钟。
@@ -28,7 +28,14 @@ bash scripts/import.sh
 bash scripts/demo.sh --with-events
 
 # 5. 浏览器打开 http://127.0.0.1:8080/
+
+# 6. 关掉（顺序、边界都在脚本里；数据全部保留，下次第 4 步秒起）
+bash scripts/stop.sh
 ```
+
+**别用 `docker compose down -v` 关。** 那会把 Doris BE 的命名卷 `rt-doris-be-data`
+一起删掉——不是「重启一下」，是 112,650 行 DWD + 88,157 行 DWS + 8 张 ADS 全部消失，
+得从 MySQL 重跑 41 万行快照重建。`stop.sh` 任何分支都不带 `-v`。
 
 `demo.sh` 是幂等的：容器在跑就跳过、topic 存在就跳过、表里有数就跳过、作业在跑就跳过。
 重复执行只会补上缺的部分。

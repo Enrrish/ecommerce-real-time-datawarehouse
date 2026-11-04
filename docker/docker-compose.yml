@@ -32,6 +32,9 @@ services:
     container_name: rt-mysql
     profiles: ["source"]
     restart: unless-stopped
+    # 默认 10s 后 SIGKILL。155 万行 InnoDB 在 checkpoint 落盘时可能更久，
+    # 硬杀留不下干净关闭标记，下次启动要做崩溃恢复（慢，且有风险）。
+    stop_grace_period: 60s
     ports:
       - "${MYSQL_PORT:-3306}:3306"
     environment:
@@ -91,6 +94,10 @@ services:
     container_name: rt-kafka
     profiles: ["source"]
     restart: unless-stopped
+    # Kafka 单节点，没有副本可以兜底。优雅停机要刷日志段 + 写
+    # .kafka_cleanshutdown 标记，硬杀会走 unclean recovery，
+    # 尾部未 flush 的消息就真的没了（这个 topic 是埋点唯一来源）。
+    stop_grace_period: 30s
     ports:
       # 只映射 EXTERNAL，9092 留在容器网络内，宿主机不暴露，避免误连
       - "${KAFKA_EXTERNAL_PORT:-29092}:29092"
@@ -149,6 +156,9 @@ services:
     container_name: rt-flink-jm
     profiles: ["compute"]
     restart: unless-stopped
+    # JobManager 要先把 checkpoint 元数据落盘再退；硬杀只是丢一次
+    # checkpoint，作业本来就要重提，给 20s 够用。
+    stop_grace_period: 20s
     command: jobmanager
     ports:
       - "${FLINK_WEB_PORT:-8081}:8081"
@@ -197,6 +207,9 @@ services:
     container_name: rt-flink-tm
     profiles: ["compute"]
     restart: unless-stopped
+    # TM 停机要触发 cancel + 最后一次 flush 到 Doris sink。
+    # 硬杀会让正在 flush 的那批数据留在 ring buffer 里丢掉。
+    stop_grace_period: 25s
     command: taskmanager
     depends_on:
       - flink-jobmanager
@@ -222,7 +235,15 @@ services:
         # 86.8MB，跑 DWD 的 6 表 join 不够；改成 4 个 slot 后每 slot 217MB。
         # slot 数不是"越多越好"，它就是内存切分粒度：作业少的时候降 slot 数，
         # 把内存集中给重作业；ODS 那种单流同步作业多的时候再调回 10。
-        taskmanager.memory.process.size: 2304m
+        #
+        # 2026-11-04 从 2304m 提到 3072m，因为 217MB/slot 仍然不够 07：
+        #   07 的四表 join 快照状态实测 **134MB**（checkpoint state_size
+        #   140,932,698 bytes），占掉 217MB 的 62%，剩下的不够 checkpoint
+        #   的 double buffer + 网络缓冲申请，表现为 TM 抛 Java heap space
+        #   整体重启（docker inspect RestartCount 涨 1），然后 07 的 4 个
+        #   算子永远卡在 initializing —— 看起来 RUNNING，实际一行不写。
+        # 提到 3072m 后 taskHeap ≈ 2.2GB / 4 slot ≈ 550MB，留足余量。
+        taskmanager.memory.process.size: 3072m
         taskmanager.memory.managed.size: 512m
         taskmanager.memory.network.min: 64m
         taskmanager.memory.network.max: 256m
@@ -232,7 +253,7 @@ services:
       - ./flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
       - ./flink/lib/flink-doris-connector-1.18-24.0.1.jar:/opt/flink/lib/flink-doris-connector-1.18-24.0.1.jar:ro
       - ./flink/lib/mysql-connector-java-8.0.27.jar:/opt/flink/lib/mysql-connector-java-8.0.27.jar:ro
-    mem_limit: ${FLINK_TM_MEM_LIMIT:-2560m}
+    mem_limit: ${FLINK_TM_MEM_LIMIT:-3328m}
     networks:
       rt-net:
         ipv4_address: 172.28.0.21
@@ -252,6 +273,9 @@ services:
     container_name: rt-doris-fe
     profiles: ["olap"]
     restart: unless-stopped
+    # FE 停机要写 edit log + 把内存里的元数据刷盘，硬杀会导致下次启动
+    # 重放 editlog（慢）。30s 是官方推荐的下限。
+    stop_grace_period: 30s
     environment:
       # 格式：<名字>:<IP>:<edit_log_port>，9010 是 FE 的元数据同步端口
       FE_SERVERS: fe1:172.28.0.10:9010
@@ -279,6 +303,10 @@ services:
     container_name: rt-doris-be
     profiles: ["olap"]
     restart: unless-stopped
+    # BE 停机会做 tablet 落盘 + 停 compaction。默认 10s 往往不够，
+    # 被 SIGKILL 之后下次启动要扫全量 rowset 做恢复（这块有 7.5GB）。
+    # 之前 BE 无限重启那次已经吃过一次苦头，这里给足 45s。
+    stop_grace_period: 45s
     depends_on:
       - doris-fe
     environment:

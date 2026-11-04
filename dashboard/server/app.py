@@ -371,6 +371,26 @@ class Handler(SimpleHTTPRequestHandler):
         }
 
 
+class QuietServer(ThreadingHTTPServer):
+    """浏览器每 1.5 秒轮询一次 /api/dashboard，关页面 / 刷新 / 强制刷新时，
+    那条在途请求会被对端直接掐断。标准库默认把这个异常原样打到 stderr：
+
+        ConnectionAbortedError: [WinError 10053] 你的主机中的软件中止了一个已建立的连接
+
+    最难受的场景是退出：按 Ctrl+C 停服务，终端上先刷一大片红色 traceback，
+    看起来像"程序崩了"，实际只是浏览器走了。这类异常在服务端没有意义
+    （对端已经不要那个字节了），静默掉。真正的代码 bug 仍然照常打印。
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Olist 实时大屏查询代理")
     ap.add_argument("--port", type=int, default=8080)
@@ -393,8 +413,7 @@ def main() -> None:
     else:
         print("[refresh] 已关闭（--no-refresh）")
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    srv.daemon_threads = True
+    srv = QuietServer((args.host, args.port), Handler)
     print(f"[http]    http://{args.host}:{args.port}/  （Ctrl+C 停止）")
     try:
         srv.serve_forever()

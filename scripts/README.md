@@ -14,7 +14,8 @@ scripts/
 ├── collect-pipeline-health.sh  # 采集链路健康度 → ads_pipeline_health
 ├── demo-change.sh        # 改一行 MySQL，量出它走到大屏要多久（含僵尸自检）
 ├── calibrate_late_ratio.py  # 给 late_ratio 做正向对照（注入已知比例的迟到事件）
-└── check_lag.py          # 端到端延迟真采样 → P50/P95/P99
+├── check_lag.py          # 端到端延迟真采样 → P50/P95/P99
+└── stop.sh               # 安全关停：停大屏 → 按依赖倒序停容器 → 打印怎么再开
 ```
 
 ## 依赖
@@ -375,3 +376,77 @@ bash scripts/demo-change.sh --keep       # 故意不回滚
 
 **回滚是有保障的**：`trap ... EXIT INT TERM` 会在任何退出路径上把 `price` 改回原值，
 包括 Ctrl-C。`--keep` 是唯一不回滚的入口，且会明确提示当前值是脏的。
+
+## `stop.sh`
+
+```bash
+bash scripts/stop.sh                 # 停大屏 + 停 6 个容器（数据全部保留）
+bash scripts/stop.sh --keep-cluster  # 只停大屏，集群继续跑
+bash scripts/stop.sh --purge         # 停完再删容器（down，卷仍保留）
+bash scripts/stop.sh --status        # 只看状态，什么都不动
+```
+
+### 为什么不直接 `docker compose down -v`
+
+6 个组件里只有 Doris BE 用命名卷，其余都是仓库内的 bind mount：
+
+| 组件 | 数据位置 | `down -v` 会怎样 |
+| --- | --- | --- |
+| MySQL | `docker/volumes/mysql`（bind mount） | 不受影响 |
+| Kafka | `docker/volumes/kafka`（bind mount） | 不受影响 |
+| Doris | `rt-doris-be-data`（**命名卷**） | **删掉**，8 张 ADS / 112,650 行 DWD 全没 |
+
+所以 `stop.sh` 任何分支都不会带 `-v`，停完还会再查一次卷在不在。
+
+### 顺序：先停大屏，再按依赖倒序停容器
+
+停大屏要在停容器之前。大屏每 15 秒 `docker exec` 进 FE 查一次表，先停容器的话
+它会连续报错十几分钟、日志刷屏，而且那几轮健康度写不进去。
+
+容器不是一个 `docker compose stop` 完事，而是逐个停，顺序按依赖倒序：
+
+```
+flink-tm → flink-jm → doris-be → doris-fe → kafka → mysql
+计算层        结果层          消息层    数据源
+```
+
+三个理由，都是实测踩出来的：
+
+1. `docker compose stop` 是**并行**的，没有顺序保证，会出现「Flink 还在写、
+   Doris 已经关了」的窗口，那批 flush 打在空气里
+2. compose 文件里的 `stop_grace_period` **只对重建后的容器生效**（写进
+   `Config.StopTimeout`）。第一次加这个配置时容器还是旧配置（实测 `StopTimeout=nil`），
+   于是走默认 10s：Doris BE / MySQL / Kafka 全部退出码 **137**（SIGKILL）。
+   重建容器后 `docker inspect` 才看到 45 / 60 / 30
+3. 逐个停才能拿到每个容器的退出码，直接看出谁被硬杀
+
+所以脚本用 `docker stop -t <grace>` 显式指定，不依赖容器创建时的配置。输出长这样：
+
+```
+  ✓ rt-flink-tm    2s 退出码 143（优雅）
+  ! rt-doris-be    45s 退出码 137（45s 内没退完，被 SIGKILL）
+```
+
+`143` = 收到 SIGTERM 自己退的，`137` = 超时被 SIGKILL。看到 137 不一定是坏事
+（Doris 下次启动会做 rowset 恢复），但连续出现就说明 grace 该调大。
+
+### 数据基线：关停前记一次行数
+
+每次关停会把 7 张主表的行数写进 `scripts/.shutdown-snapshot.txt`，
+下次 `--status` 直接对比：
+
+```
+基线时间 2026-11-04 11:28:18 关停
+    ads_realtime_overview      88157     ✓ 未变
+    dwd_trade_order_detail     112650    ✓ 未变
+    dwd_user_event_clean       104464    → 106469（差 +2005）
+```
+
+埋点那两张表行数上升是正常的（停机窗口里 Kafka 积压被补消费），
+**下降才是问题**——那说明有数据丢了。
+
+### 重启后 Flink 是空 session
+
+容器起来不等于作业在跑。Docker 重启会丢掉整个 Flink session，4 个作业一个都不在。
+重启走 `bash scripts/demo.sh --no-dashboard`（幂等，会补提作业），
+然后**等 07 的快照跑完**（41 万行，1~2 分钟）再验收：`RUNNING` 不等于在产出。
