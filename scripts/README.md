@@ -360,7 +360,7 @@ bash scripts/demo-change.sh --keep       # 故意不回滚
 
 | 观测点 | 实测 | 时间花在哪 |
 | --- | --- | --- |
-| DWS | 1.4 ~ 3.7 s | binlog → CDC → 三表 join → 分钟聚合 → Doris sink（07 的 flush 是 1 s） |
+| DWS | 1.4 ~ 4.2 s | binlog → CDC → 三表 join → 分钟聚合 → Doris sink（07 的 flush 是 1 s） |
 | ADS | 10 ~ 57 s | `ads_realtime_overview` 是 60 s 一轮的**批刷**，撞在周期哪个位置全看运气 |
 | 大屏 | ≈ ADS + 1.2 s | 面板 1 s 一轮轮询 API |
 

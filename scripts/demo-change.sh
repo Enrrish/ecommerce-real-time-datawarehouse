@@ -14,7 +14,7 @@
 #   大屏   → GET /api/dashboard 的 kpi.gmv 变化       ← 面板读 ADS，跟着变
 #
 # 预期形状（P8 实测，两次改动取一组）：
-#   DWS  1.4 ~ 3.4 s    07 的 sink flush 是 1 s（无持续数据流，不产生版本堆积）
+#   DWS  1.4 ~ 4.2 s    07 的 sink flush 是 1 s（无持续数据流，不产生版本堆积）
 #   ADS  ≤ 60 s 一轮    这是 ads_realtime_overview 的批刷周期，不是链路慢
 #   大屏  ≈ ADS + 1 s   面板 1 s 一轮轮询
 #   所以「端到端 50 s 左右」的主体是**批刷周期**，不是 Flink。要看实时性就看 DWS 那一行。
