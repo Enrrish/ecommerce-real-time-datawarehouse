@@ -54,8 +54,19 @@ docker/
 ├── volumes/              # 容器数据目录：mysql/、kafka/、doris-fe/、doris-be/（整目录不入库）
 ├── flink/
 │   └── lib/              # 四个 connector jar，由 scripts/fetch-flink-jars.sh 下载（不入库）
-└── doris/                # FE/BE 自定义配置（暂无，全部走环境变量）
+└── be-conf/
+    └── be.conf           # Doris BE 的配置覆盖，只读挂到 /opt/apache-doris/be/conf/be.conf
 ```
+
+> **`be-conf/` 是唯一进 git 的配置目录**，因为它改的是运行行为而不是运行数据
+> （`volumes/` 整个被忽略）。目前里面只有一处改动：`trash_file_expire_time_sec = 3600`。
+>
+> 为什么直接挂 `be.conf` 而不走官方的 `CONFIGMAP_MOUNT_PATH`：这个镜像里有两个入口脚本，
+> PID 1 实际跑的是 `/usr/local/bin/entry_point.sh`，它**不读那个变量**；有这个函数的是
+> `/opt/apache-doris/be_entrypoint.sh`，但没被调用。设了 configmap 会静默失效 ——
+> 容器起来了、配置却还是默认值，日志里连一句 skip 都没有。
+>
+> 只读挂载是安全的：`entry_point.sh` 全程不写 `be.conf`，`start_be.sh` 也只读。
 
 > **Flink 的 checkpoint 不在 `docker/volumes/` 下**，而是仓库根的 `flink/checkpoints/`
 > （compose 里写的是 `../flink/checkpoints:/opt/flink/checkpoints`）。原因是它属于

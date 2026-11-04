@@ -335,6 +335,18 @@ services:
       # 命名卷落在 WSL 的 ext4 上，df -i 有 6700 万个 inode，一切正常。
       # 排查入口是 `df -T`（看文件系统类型）和 `df -i`（看 inode），不是 `df -h`。
       - rt-doris-be-data:/opt/apache-doris/be/storage
+      # be.conf 直接挂到镜像读的那个路径。放在 volumes/ 之外，因为它要进 git
+      # （配置即代码），而 volumes/ 是运行期数据、整个被 .gitignore 掉了。
+      #
+      # 为什么不用官方的 CONFIGMAP_MOUNT_PATH：镜像里有两个入口脚本，
+      #   /usr/local/bin/entry_point.sh   ← 实际在跑（PID 1 = bash entry_point.sh）
+      #   /opt/apache-doris/be_entrypoint.sh ← 有这个函数，但没被调用
+      # 前者只从 FE_SERVERS / BE_ADDR 环境变量推配置，**不读 CONFIGMAP_MOUNT_PATH**，
+      # 设了也静默忽略（日志里连 skip 提示都没有）。所以直接挂 be.conf 更可靠。
+      #
+      # 只读是安全的：entry_point.sh 全程不写 be.conf，start_be.sh 也只读
+      # （`done < be.conf` 逐行 source + `grep ^mem_limit`）。
+      - ./be-conf/be.conf:/opt/apache-doris/be/conf/be.conf:ro
       # 日志留在 bind mount，方便直接在资源管理器里翻
       - ./volumes/doris-be/log:/opt/apache-doris/be/log
     healthcheck:
