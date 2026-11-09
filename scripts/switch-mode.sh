@@ -22,10 +22,12 @@
 #
 #   内存账：
 #     realtime  8960MB（mysql 768 + kafka 768 + fe 1536 + be 1792 + jm 768 + tm 3328）
-#     bi       11136MB（fe 1536 + be 1792 + finebi 7808）
-#     bi 的 7808 来自 FineBI 的 JVM 自检下限（四项和 7680 不可压），
-#     所以它比 VM 实见的 9947MB 还高 —— 这是**纸面超卖**，不是笔误：
-#     mem_limit 只是保险丝，实测三容器合计 3.7GB，余量 5.6GB。
+#     bi       16768MB（fe 1536 + be 1792 + finebi 7808 + master 2048 + worker 3584）
+#     bi 的 7808 来自 FineBI 的 JVM 自检下限（四项和 7680 不可压）；
+#     worker 的 3584 来自 polars 的分账模型（Xmx < 1256 会算出负数直接崩，
+#     详见 docker-compose.finebi.yml 文件头「六」），这两项都压不下去。
+#     所以限额合计比 VM 实见的 9947MB 高 —— 这是**纸面超卖**，不是笔误：
+#     mem_limit 只是保险丝，实测五容器合计约 4.8GB，余量 5GB。
 #
 # 不做的事（故意的）：
 #   - 不碰 .wslconfig。提高到 12GB 能让两套共存，但 Windows 只剩 3.6GB，
@@ -41,6 +43,10 @@ cd "$ROOT" || exit 1
 
 MAIN_COMPOSE="$ROOT/docker/docker-compose.yml"
 BI_COMPOSE="$ROOT/docker/docker-compose.finebi.yml"
+
+# FineBI 侧三个容器。顺序有意义：停的时候从左往右（worker 先死，master 后死），
+# 起的时候从右往左（master 先活，worker 才能注册）。
+BI_CONTAINERS="rt-finebi-worker rt-finebi-master rt-finebi"
 
 MODE=status
 SUBMIT=0
@@ -107,8 +113,8 @@ mem_report() {  # $1=mode
   if [[ -z "$vm" ]]; then warn "拿不到 Docker VM 内存（引擎没跑？）"; return 0; fi
 
   if [[ "$1" == "bi" ]]; then
-    used=$(sum_used rt-doris-fe rt-doris-be rt-finebi)
-    limit=$(sum_limits rt-doris-fe rt-doris-be rt-finebi)
+    used=$(sum_used rt-doris-fe rt-doris-be $BI_CONTAINERS)
+    limit=$(sum_limits rt-doris-fe rt-doris-be $BI_CONTAINERS)
   else
     used=$(sum_used rt-mysql rt-kafka rt-doris-fe rt-doris-be rt-flink-jm rt-flink-tm)
     limit=$(sum_limits rt-mysql rt-kafka rt-doris-fe rt-doris-be rt-flink-jm rt-flink-tm)
@@ -134,7 +140,8 @@ show_status() {
   local rt=0 bi=0 c st
 
   step "容器"
-  for c in rt-mysql rt-kafka rt-flink-jm rt-flink-tm rt-doris-fe rt-doris-be rt-finebi; do
+  for c in rt-mysql rt-kafka rt-flink-jm rt-flink-tm rt-doris-fe rt-doris-be \
+           rt-finebi-master rt-finebi-worker rt-finebi; do
     st=$(d inspect -f '{{.State.Status}}{{if .State.Health}} / {{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)
     if [[ -z "$st" ]]; then
       printf '    %-14s %s\n' "$c" "(不存在)"
@@ -143,8 +150,8 @@ show_status() {
     printf '    %-14s %s\n' "$c" "$st"
     [[ "$st" == running* ]] || continue
     case "$c" in
-      rt-finebi) bi=$((bi + 1)) ;;
-      *)         rt=$((rt + 1)) ;;
+      rt-finebi*) bi=$((bi + 1)) ;;
+      *)          rt=$((rt + 1)) ;;
     esac
   done
 
@@ -173,16 +180,40 @@ show_status() {
 
 docker_up_check() { d info >/dev/null 2>&1 || die "Docker 引擎没在运行"; }
 
+# 轮询到 healthy。$1=容器名 $2=最多等几秒（默认 120）
+# 容器退出就立刻返回，不白等 —— 引擎类容器启动失败是直接的，不会自愈。
+wait_healthy() {
+  local c=$1 max=${2:-120} i st
+  for i in $(seq 1 $((max / 5))); do
+    if [[ "$(d inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" == "exited" ]]; then
+      echo " → 退出了（退出码 $(d inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)）"
+      return 1
+    fi
+    st=$(d inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)
+    if [[ "$st" == "healthy" ]]; then echo " → healthy（$((i * 5))s）"; return 0; fi
+    printf '.'; sleep 5
+  done
+  echo " → ${max}s 内没 healthy"
+  return 1
+}
+
 # --- 停 FineBI --------------------------------------------------------------
 stop_finebi() {
-  if [[ "$(d inspect -f '{{.State.Running}}' rt-finebi 2>/dev/null)" == "true" ]]; then
-    # FineBI 的 HSQLDB 配置库要写 checkpoint，给 60s（compose 里也写了
-    # stop_grace_period: 60s，但那只在重建后生效，这里显式传 -t 更稳）
-    d stop -t 60 rt-finebi >/dev/null 2>&1
-    ok "rt-finebi 已停（退出码 $(d inspect -f '{{.State.ExitCode}}' rt-finebi 2>/dev/null)）"
-  else
-    info "rt-finebi 本来就没在跑"
-  fi
+  local c any=0
+  # 顺序 = BI_CONTAINERS 的顺序：worker → master → web。
+  # 先停 worker 是因为它的 monitor 会盯着 master，反过来停会让它刷一串
+  # "master 失联"再自己 exit 66，日志脏。
+  for c in $BI_CONTAINERS; do
+    if [[ "$(d inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" == "true" ]]; then
+      # FineBI 的 HSQLDB 配置库要写 checkpoint，给 60s（compose 里也写了
+      # stop_grace_period: 60s，但那只在重建后生效，这里显式传 -t 更稳）
+      d stop -t 60 "$c" >/dev/null 2>&1
+      ok "$c 已停（退出码 $(d inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)）"
+      any=1
+    fi
+  done
+  [[ "$any" -eq 0 ]] && info "三个 FineBI 容器本来都没在跑"
+  return 0
 }
 
 # --- 实时模式 ---------------------------------------------------------------
@@ -248,36 +279,53 @@ mode_bi() {
   ( cd "$ROOT/docker" && d compose --profile olap up -d doris-fe doris-be ) \
     | grep -E 'Started|Created|Running|Error' | sed 's/^/  /'
 
-  step "起 FineBI"
-  if [[ "$(d inspect -f '{{.State.Running}}' rt-finebi 2>/dev/null)" == "true" ]]; then
-    info "rt-finebi 已在跑"
+  step "起 FineBI（顺序：master → worker → web）"
+
+  # 顺序不能乱，也不能靠 compose 的 depends_on 一把起：
+  #   · worker 一启动就去连 master:8000。连不上时它的 monitor 直接 exit 66
+  #     （不重试、不等待），所以 master 必须**先 healthy**。
+  #   · web 反过来最不怕等，放最后只是为了日志好看。
+  if [[ "$(d inspect -f '{{.State.Health.Status}}' rt-finebi-master 2>/dev/null)" == "healthy" ]]; then
+    info "rt-finebi-master 已 healthy"
   else
-    ( cd "$ROOT/docker" && d compose -f docker-compose.finebi.yml up -d ) \
+    ( cd "$ROOT/docker" && d compose -f docker-compose.finebi.yml up -d finebi-master ) \
       | grep -E 'Started|Created|Error' | sed 's/^/  /'
-    printf '    等待健康（首次启动约 25s，挂新卷要复制 webroot 会再久一点）'
-    local i st
-    for i in $(seq 1 40); do
-      st=$(d inspect -f '{{.State.Health.Status}}' rt-finebi 2>/dev/null)
-      [[ "$st" == "healthy" ]] && { echo " → healthy"; break; }
-      if [[ "$(d inspect -f '{{.State.Status}}' rt-finebi 2>/dev/null)" == "exited" ]]; then
-        echo " → 退出了"
-        # 卷被重建后，WEB-INF/lib 里会变回原厂的 client 版 polars jar，
-        # bi-web 就会在 cluster 初始化时抛 ClassNotFoundException 并 shutdown。
-        # 本项目的解法是**把 polars jar 移除**（Java 8 装不下 Java 11 的引擎），
-        # 不是补 jar —— 补了会变成 UnsupportedClassVersionError。
-        if d logs rt-finebi 2>&1 | grep -q 'BIWorkerModule'; then
-          warn "卷里又有 polars jar 了（重建卷后必复发）"
-          info "移除命令见 docs/note/27 §3.2；移除后 25 秒 healthy"
-        fi
-        break
-      fi
-      printf '.'; sleep 5
-    done
+    printf '    master 加载 357MB 引擎包'
+    wait_healthy rt-finebi-master 120 || warn "master 没起来，看：docker logs rt-finebi-master"
+  fi
+
+  ( cd "$ROOT/docker" && d compose -f docker-compose.finebi.yml up -d finebi-worker finebi ) \
+    | grep -E 'Started|Created|Error' | sed 's/^/  /'
+
+  printf '    worker'
+  if ! wait_healthy rt-finebi-worker 180; then
+    warn "worker 没起来"
+    info "常见原因：Xmx 小于 2048 会撞 polars 的分账检查，日志里搜 'memory size for polars too small'"
+    info "另一种：master 在上一步没真正 ready，worker 的 monitor 会 exit 66"
+  fi
+
+  printf '    web'
+  if ! wait_healthy rt-finebi 150; then
+    warn "web 没起来"
+    # 卷被重建后，WEB-INF/lib 里会变回原厂的 client 版 polars jar，
+    # bi-web 就会在 Loading polars 时抛 ClassNotFoundException 并 shutdown。
+    # 本项目的解法是**把 polars jar 移除**（Java 8 装不下 Java 11 的引擎），
+    # 不是补 jar —— 补了会变成 UnsupportedClassVersionError。
+    if d logs rt-finebi 2>&1 | grep -q 'BIWorkerModule'; then
+      warn "卷里又有 polars jar 了（重建卷后必复发）"
+      info "移除命令见 docs/note/27 §3.2；移除后 25 秒 healthy"
+    fi
   fi
 
   mem_report bi
 
   hr
+  echo "引擎拓扑"
+  info "web    172.28.0.30:8080（宿主 9080）"
+  info "master 172.28.0.31:8000  元数据与调度"
+  info "worker 172.28.0.32:9001  计算（monitor 在 9000）"
+  info "worker 是否注册成功：docker logs rt-finebi-master | grep 'Sync Worker'"
+  echo
   echo "BI 模式下能查的数据（Doris 里是上次跑完的静态快照）"
   info "库 realtime_dw，FE 9030（MySQL 协议）"
   info "DWD dwd_trade_order_detail  112,650 行"

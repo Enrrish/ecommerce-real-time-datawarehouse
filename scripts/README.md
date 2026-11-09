@@ -456,26 +456,34 @@ flink-tm → flink-jm → doris-be → doris-fe → kafka → mysql
 
 ```bash
 bash scripts/switch-mode.sh                  # 看当前模式 + 内存账（同 status）
-bash scripts/switch-mode.sh bi               # BI 模式：只留 Doris，起 FineBI
+bash scripts/switch-mode.sh bi               # BI 模式：只留 Doris，起 FineBI 三容器
 bash scripts/switch-mode.sh realtime         # 实时模式：起 6 容器，停 FineBI
 bash scripts/switch-mode.sh realtime --submit  # 顺带把 4 个作业提起来
 ```
 
+BI 模式的三个容器按 `master → worker → web` 起，脚本会逐个等 healthy：
+worker 一启动就注册到 `master:8000`，连不上它的 monitor 会直接 `exit 66`（不重试），
+所以顺序不能靠 compose 的 `depends_on` 图省事。
+
 ### 为什么是"切换"而不是"共存"
 
 Docker VM 实见 9947MB，实时模式 6 个容器限额已经是 8960MB，只剩 987MB 余量。
-FineBI 单容器空载就要 1540MB。两套同时开必然超。
+BI 模式那三个容器空载就要 3.2GB。两套同时开必然超。
 
-FineBI 那一档只能给 7808MB —— 这不是选出来的，是它的 JVM 自检顶出来的**下限**
-（四项和 7680MB，没压是因为压了省不出用量，见 `docs/note/27`）：
+两档限额里有两项是**顶出来的下限**，不是选的：
+
+- FineBI web 的 **7808MB**：JVM 自检要求 Xmx + Direct + Metaspace + CodeCache ≤ 容器限额，
+  厂商原串四项和 7680
+- FineBI worker 的 **3584MB**：polars 把 Xmx 当"整机内存"来分账，
+  Xmx < 1256 会算出负数直接崩（`memory size for polars too small : -xxx`）
 
 | 模式 | 组成 | 限额 |
 | --- | --- | --- |
 | realtime | mysql + kafka + fe + be + jm + tm | 8960MB |
-| bi | fe + be + finebi | 11136MB |
+| bi | fe + be + finebi-master + finebi-worker + finebi | 16768MB |
 
-`bi` 的 11136MB 比 VM 实见的 9947MB 还高，属于**纸面超卖**：`mem_limit` 是保险丝
-不是预占，实测三容器合计只用 3.7GB，VM 内还剩 5.6GB 可用。
+`bi` 的 16768MB 比 VM 实见的 9947MB 高得多，属于**纸面超卖**：`mem_limit` 是保险丝
+不是预占，实测五容器合计只用 4.8GB，VM 内还剩 5GB 可用。
 
 ### BI 模式为什么能砍掉 Flink 和 Kafka
 

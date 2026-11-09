@@ -1,17 +1,21 @@
 # 27 · FineBI 与内存预算
 
 > 这篇记录一次真实的技术选型：拿到一个 13GB 的「FineBI 离线部署包」，要判断这台 16GB 的机器能不能跑，
-> 最后怎么跑。结论是**能跑，但不是按包的设计意图跑**——包里那套东西的官方最低配置是 64GB。
+> 最后怎么跑。结论分两段：
 >
-> 中途踩了三个坑，都在正文里留了完整复盘：
+> - **引擎集群能跑**：master + worker 两个容器在这台机器上起来了、注册成功、内存还剩一半
+> - **FineBI 本身用不了**：`bi-web` 是 Java 8，而 polars 引擎（包括它的"进程内迷你模式"）
+>   全部是 Java 11 编译的类。web 要么没有引擎，要么加载失败直接崩，两条路都进不去系统
 >
-> 1. `bi-web` 单镜像**缺一个 341MB 的引擎 jar**（发布包的结构问题，且 `docker logs` 会骗人）
-> 2. 补上 jar 之后才发现更硬的一层：**那个 jar 是 Java 11 编译的，而 `bi-web` 离不开 Java 8**
-> 3. 启动自检要求四项 JVM 内存参数之和不超过容器限额，所以 `mem_limit` 有个 7808MB 的硬下限
+> 中途踩了四个坑，都在正文里留了完整复盘：
 >
-> 第 2 条是这篇最贵的一课：我一开始以为"换个 JDK 就行"，实测连踩三个子坑才确认
-> **`bi-web` 与 polars 引擎不可能共存于一个 JVM**。最终做法是把 polars 整个移除，
-> 退回内置的 spider 引擎（见 2.4）。
+> 1. `docker logs` 会骗人 —— `BIDiskFull: proxied System.out and System.err` 之后真日志只在 `fanruan.log`
+> 2. `bi-web` 单镜像**缺 357MB 的引擎实现包**，而 `polars-client`（141MB）里只有 RPC 桩
+> 3. 补上 jar 之后撞到更硬的一层：**实现包是 class 55，`bi-web` 是 class 52**，换 JDK 又会崩另外三处
+> 4. worker 的 `Xmx` 低于 2048 时，polars 的内存分账会算出负数直接崩（见 2.11）
+>
+> 第 2、3 条是这篇最贵的一课。最终做法是：**三容器的编排留着（引擎侧真的能跑），
+> web 侧退回内置 spider 并接受部署向导过不去**——要用 FineBI 只能走官网单机版安装包。
 >
 > 全文只有两个数字来源：帆软官方文档，和本机实测。凡是估的都会写明是估的。
 
@@ -548,6 +552,9 @@ BI 模式下三个容器的真实占用：
 
 VM 内 `MemAvailable` 还有 **5.6 GiB**。限额离实际用量的距离，就是"纸面超卖"仍然安全的余量。
 
+> 上表是**单容器阶段**的数字。补齐 master / worker 之后的五容器实测见 2.11：
+> 合计 **4914 MiB**，限额 16768 MiB，余 5033 MiB。多两个容器只多吃 1.3 GB。
+
 **这里必须分清两个口径** —— 混在一起讲就会自相矛盾：
 
 | 口径 | 怎么算 | 数值 | 语义 |
@@ -596,6 +603,103 @@ Doris FE 的 9030 是 MySQL 协议，FineBI 直接当 MySQL 数据源接，**不
 `cum_gmv` 不可 SUM、`buyer_cnt` 跨维度不可加这些红线（见 `20-指标口径设计.md`）在 BI 里同样成立，
 在 FineBI 里做计算字段时要自己守住。
 
+### 2.11 补齐 master / worker：集群能起，但 web 接不上去
+
+上一版只跑 bi-web 一个容器，被"缺 341MB 引擎 jar"卡住。既然那 357MB 的实现包在
+`bi-engine-master` / `bi-engine-worker` 镜像里各自带着，正确做法不是往 web 里塞，
+而是**按角色各起一个容器**，让 web 通过 RPC 去连。
+
+#### 三个镜像其实是同一套基础层的三种剪裁
+
+| 镜像 | 入口 | `WEB-INF/lib` | JDK |
+| --- | --- | --- | --- |
+| `bi-web` | `/docker-entrypoint.sh` + `catalina.sh run` | 37 个，含 polars-**client** 141MB | 8 |
+| `bi-engine-master` | `/opt/polars/docker-entrypoint.sh` + `startup.sh` | 6 个，含 polars-**实现** 357MB | 11 |
+| `bi-engine-worker` | 同上 | 同上（与 master 完全一致） | 11 |
+
+master 和 worker 的 lib **完全一样**，角色靠 `APP_TYPE` 环境变量分支
+（`startup.sh` 里 `if [ "$APP_TYPE" = "bi-engine-master" ]`）。
+两个镜像的 Env 里还塞着全套 `RUNTIME_ENV_bi-engine-*` / `RUNTIME_CMD_bi-web=` ——
+那是 finekey 编排产物，手写 compose 用不到。
+
+#### 关键环境变量（`run_bi_master_slim.sh` / `run_bi_worker_slim.sh` 读的）
+
+| 变量 | master | worker | 说明 |
+| --- | --- | --- | --- |
+| `APP_TYPE` | `bi-engine-master` | `bi-engine-worker` | 角色开关 |
+| `POLARS_HOST` | `172.28.0.31` | `172.28.0.32` | **必须写容器 IP**，默认 127.0.0.1 会绑 loopback，别人连不上 |
+| `POLARS_PORT` | 8000 | 9001 | worker 的 monitor 占 `port-1`（9000） |
+| `ENV_MASTER_HOST` / `PORT` | — | `172.28.0.31` / 8000 | 单 master 模式的坐标 |
+| `POLARS_HOME` | `/data/polars` | `/data/polars` | 元数据、conf、gc、dump |
+| `ENV_POLARS_TIERS` | `sync`（默认） | `sync` | **不需要 MinIO**，见下 |
+| `IS_CONTAINER` | `true` | `true` | `start.sh` 里 `exec $cmd` 前台运行；不设会 nohup 后 PID1 秒退 |
+| `OPS_URL` | **不设** | **不设** | 设了会多起一个 256MB 的 crash 监控 JVM |
+| `BI_JAR_HOME` | **不设** | **不设** | 默认指向自己容器的 lib，正好是那 6 个 jar |
+
+`sync` 是 polars 的存储层默认档：节点间直接传数据，不落共享存储。
+官方推荐 `s3v2`（要 MinIO）是因为多机弹性伸缩需要共享数据面；
+单 worker + 11 万行用 `sync` 足够，省掉一个 MinIO 容器。
+
+#### 坑：worker 的 Xmx 低于 2048 会直接崩
+
+第一版给了 `-Xmx1024m`，容器 25 秒后 `exit 255`：
+
+```
+java.lang.IllegalArgumentException: The memory size for polars too small : -198642237
+    at com.fanruan.polars.execution.ResourcePlate.start0(ResourcePlate.java:133)
+```
+
+值是**负数**。反编译 `fine-bi-engine-polars-6.1.jar` 才看明白 polars 的分账模型：
+
+| 配置键 | 默认值 | 含义 |
+| --- | --- | --- |
+| `polars.core.memory.system.max.size` | **本进程 Xmx** | "polars 认为的可用内存上限" |
+| `polars.core.memory.system.reserve.radio` | `0.12` | 给系统预留，先从上限里扣 |
+| `polars.spark.memory.ratio` | `0.4` | Spark 引擎占上限的比例 |
+| `SPARK_MEMORY_MIN` | **1GB** | 上一项的**硬下限**，`Math.max(ratio×上限, 1GB)` |
+| lake 写入 + 队列 | ≈ 6.5% | `LAKE_WRITER_MEMORY_RATIO` 等 |
+
+Xmx=1024 时：`1024 - 122.9(12%) - 1024(Spark 下限) - 69.8(写入) = -198.6 MB`，
+和报错值 `-198642237` 逐字节吻合。
+
+反解下限：`0.815 × Xmx > 1024` → `Xmx > 1256`；留 500MB 真实计算空间 → `Xmx ≥ 1883`。
+所以定 **2048**。**这不是"数据小用不着更大"，是引擎的分账模型不允许更小。**
+
+#### 结果：集群成型，但 web 连不上
+
+master 起来了，worker 也注册进去了：
+
+```
+Sync Worker | Worker(Worker) | address:/172.28.0.32, port:9001
+```
+
+但 web 侧卡死。把 client jar 放回去，容器 25 秒 `exit 1`，`fanruan.log` 里：
+
+```
+ExcelDataSourceEngineDriver.init
+  → ClientInProcessConnector.start
+    → PolarsModule.start
+      → LocalMiniProcessStart.start          ← 进程内迷你集群
+        → BIWorkerModule.registerInProcess
+          → Reflect.forName("com.fanruan.polars.bi.BIWorkerModule")
+            → ClassNotFoundException
+```
+
+`LocalMiniProcessStart` 的方法名里就写着 InProcess —— 它**在当前 JVM 里**用
+`Class.forName` 加载 `com.fanruan.polars.bi.BIWorkerModule`。而那个类是 **class 55（Java 11）**，
+web 是 **class 52（Java 8）**。所以：
+
+- 不给 client jar → web 活着，但 `cluster=false`、没有 polars，页面报 `BI-Design_Engine_Error`
+- 给 client jar → web 在 `LocalMiniProcessStart` 处崩，进不去
+
+`PolarsUpdateRegister.registerIfOpen` 的三种 role（`local`/`minicluster`/`direct`）
+全部依赖这批 Java 11 的类，**没有一条通向"只做客户端连远程 master"**（那条在 finekey
+的 K8s 编排层里，由 `DefaultK8sConfig` 从 `master` 这个服务名解析，web 自身没有这个开关）。
+
+**结论**：finekey 这套包在"手工 compose + 单机"下拼不出可用的 FineBI。
+集群能起，web 用不上。要用 FineBI 只能走官网的**单机版安装包**（一个 tar.gz 解压即用，
+lib 里是完整的 Java 8 实现），不是这个集群镜像包。
+
 ---
 
 ## 三、速查
@@ -621,30 +725,47 @@ docker load -i /d/finebi-pkg/finekey/resources/images/bi61all-tomcat-amd64-publi
 
 ```bash
 # 起停（独立 compose，项目名 rt-bi）
+# 三容器有严格顺序：master 先 healthy，worker 才注册得上去
+bash scripts/switch-mode.sh bi        # 推荐：按 master → worker → web 起，并逐个等就绪
 cd docker && docker compose -f docker-compose.finebi.yml up -d
 cd docker && docker compose -f docker-compose.finebi.yml down     # 卷保留
 cd docker && docker compose -f docker-compose.finebi.yml down -v  # 卷也删（工程配置丢失）
 
+# 三容器状态一眼看
+docker ps --filter name=rt-finebi --format '{{.Names}}\t{{.Status}}'
+
+# worker 有没有注册进 master（唯一可信的集群健康判据）
+docker logs rt-finebi-master 2>&1 | grep 'Sync Worker' | tail -2
+
 # 看真实占用
-docker stats --no-stream rt-finebi rt-doris-fe rt-doris-be
+docker stats --no-stream rt-finebi rt-finebi-master rt-finebi-worker rt-doris-fe rt-doris-be
 
 # 看 JVM 实际生效的堆参数（别信 compose，信 ps）
 docker exec rt-finebi ps -ef | grep -o '\-Xmx[0-9a-zA-Z]*'
+docker exec rt-finebi-worker ps -ef | grep -o '\-Xmx[0-9a-zA-Z]*'   # monitor 256M + worker 2048M
 
 # 看 JVM 是几 —— 排查 UnsupportedClassVersionError 的第一步
-docker exec rt-finebi java -version
+docker exec rt-finebi java -version          # 1.8
+docker exec rt-finebi-worker java -version   # 11
 
-# 看 polars 引擎 jar 是被启用还是被禁用（本项目最终是禁用）
+# 看 polars 引擎 jar 是被启用还是被禁用（web 侧本项目最终是禁用）
 docker run --rm -v rt-finebi-webroot:/w alpine sh -c \
   'ls /w/WEB-INF/lib/ /w/WEB-INF/lib.disabled/ 2>/dev/null | grep -i polars'
 
-# 恢复 polars jar（只在要改走"官方三容器"时才需要）
+# 恢复 web 的 client jar（会崩，只在复现问题时用）
 docker run --rm -v rt-finebi-webroot:/w alpine sh -c \
-  'mv /w/WEB-INF/lib.disabled/fine-bi-engine-polars-6.1.jar /w/WEB-INF/lib/'
+  'mv /w/WEB-INF/lib.disabled/fine-bi-engine-polars-client-6.1.jar /w/WEB-INF/lib/'
+
+# worker 起不来先看这两行
+docker exec rt-finebi-worker sh -c 'tail -20 /data/polars/logs/error.log'
+docker exec rt-finebi-worker sh -c 'tail -5  /data/polars/monitor/logs/error.log'
+# 日志里 "memory size for polars too small : -xxx" = Xmx 给小了（见 2.11）
 
 # 看 FineBI 业务日志 —— 注意不是 FineLog/（那里只有 gc/safepoint/hs_err）
 docker exec rt-finebi sh -c 'ls -lt /usr/local/tomcat/logs/*.log | head -3'
 docker exec rt-finebi sh -c 'grep -E "ERROR|Exception" /usr/local/tomcat/logs/fanruan.log | tail -20'
+# stdout 被 `BIDiskFull: proxied System.out and System.err` 重定向之后，
+# docker logs 就看不到错，真错误一定在 fanruan.log 里
 # stdout 被重定向过就看这个提示：BIDiskFull: proxied System.out and System.err
 
 # 健康状态

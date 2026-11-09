@@ -1,76 +1,122 @@
 # =============================================================================
-# FineBI 6.1 —— 单容器分析模式（方案 D：与实时数仓二选一）
+# FineBI 6.1 —— 三容器分析模式（web + engine-master + engine-worker）
 # -----------------------------------------------------------------------------
 # 这个文件是独立的 compose，与 docker-compose.yml 互不影响：
 #   起：docker compose -f docker-compose.finebi.yml up -d
 #   停：docker compose -f docker-compose.finebi.yml down
 # 用 scripts/switch-mode.sh 切换更省事（它会顺手算内存账）。
 #
-# 为什么只跑 bi-web 一个容器，不跑 finekey 那套 23 个镜像？
+# -----------------------------------------------------------------------------
+# 一、拓扑
+# -----------------------------------------------------------------------------
+#   rt-finebi          bi-web             172.28.0.30  宿主 9080 -> 8080
+#   rt-finebi-master   bi-engine-master   172.28.0.31  :8000
+#   rt-finebi-worker   bi-engine-worker   172.28.0.32  :9001（自己带 monitor :9000）
 #
-#   1. 那个 13GB 的包是 FineOps 企业版**集群**编排包，不是"一个 BI 镜像"。
-#      官方最低配置方案是 16 核 / 64G 内存，且强制部署
-#      1×bi-web + 1×bi-engine-master + 1×bi-engine-worker + 1×bi-minio，
-#      外加 nginx / mysql 配置库 / es 日志存储。64G 是这台机器的 4 倍。
+#   三者通过 rt-net 用固定 IP 互访。web 是 Tomcat 入口，master 是调度/元数据，
+#   worker 是真正算数的引擎。页面上的「部署向导 → 引擎」这一步，等的就是
+#   master 在 8000 上应答。
 #
-#   2. 官方最低档面向的是"日活 50 人、单表 500 万行、表数 500"的企业规模。
-#      本项目 DWD 112,650 行、DWS 88,157 行，差了 45 倍，不需要那个架构。
+# -----------------------------------------------------------------------------
+# 二、为什么必须是三个容器
+# -----------------------------------------------------------------------------
+#   FineBI 6.x 的 polars 引擎是**独立进程 + 独立发行包**，不是 web 里的一个模块：
 #
-#   3. bi-web 的 WEB-INF/lib 里有 fine-bi-engine-spider-6.1.jar —— 这是
-#      **内置计算引擎**，本地就能算。polars 是另一套引擎（大数据量加速用），
-#      拆在 bi-engine-master / bi-engine-worker 两个独立镜像里。
+#     镜像                   WEB-INF/lib 内容                     JDK
+#     bi-web                 37 个 jar，含 polars-**client** 141MB  Java 8
+#     bi-engine-master        6 个 jar，含 polars-**实现** 357MB     Java 11
+#     bi-engine-worker        6 个 jar，同上（与 master 完全一致）    Java 11
 #
-#   4. 6.1 而不是 7.5：7.x 把指标中心/引擎彻底服务化，官方没有单容器形态；
-#      6.1 保留内置 spider 引擎，能单跑。这是选 6.1 的唯一理由。
+#   两张 lib 是**两套类**：client 只有 RPC 桩和协议，实现在另外 357MB 里。
+#   之前把 357MB 的实现 jar 塞进 web 的 37 个 jar 里，直接
+#   `UnsupportedClassVersionError: class 55.0 vs 52.0` —— 因为那两个 jar
+#   是不同 JDK 编的。**这不是打包缺漏，是 Java 版本边界。**
 #
-#   5. **polars 引擎在 bi-web 里注定跑不起来，所以本项目把它整个移除**。
-#      这不是偷懒，是实测出来的死结：
-#        · bi-web 的单镜像只有 fine-bi-engine-polars-client（客户端）
-#        · 真引擎 fine-bi-engine-polars-6.1.jar 在 worker 镜像里，341MB
-#        · 那个 jar 是 **Java 11** 编译（class 55.0），而 bi-web 是 **Java 8**（52.0）
-#        · 把 JDK 换成 11 又会崩另外三处：entrypoint 硬拼 JDK9 已移除的
-#          -XX:+PrintGCDateStamps、FineAssist 的 JNI native agent 只认 Java 8、
-#          fine-core-11.0.jar 里的 *.classx 加密类在 Java 11 下解不开
-#        · 结论：bi-web 绑定 Java 8，polars 绑定 Java 11，同一个 JVM 装不下
-#      完整复盘见 docs/note/27 §2.3–2.4。
+#   所以：master / worker 各自用**镜像自带**的 lib，绝不去挂 web 的卷。
+#   脚本里 BI_JAR_HOME 默认就是自己容器内的
+#   /usr/local/tomcat/webapps/webroot/WEB-INF/lib/*，正好命中那 6 个 jar。
+#   **不要设 BI_JAR_HOME**，让它走默认。
 #
-#      **做法**：把 worker 里的 engine jar 移到 WEB-INF/lib.disabled/，
-#      client 版也不放回，只留 spider 引擎。移完 25 秒 healthy、
-#      /system/health 从 400 回到 200，所有 ClassFormatError 归零。
-#      **卷重建后要重新移除一次**，命令见 docs/note/27 §3.2。
+# -----------------------------------------------------------------------------
+# 三、为什么不需要 MinIO
+# -----------------------------------------------------------------------------
+#   polars 的存储层有三档，由 ENV_POLARS_TIERS 选：
+#     sync（默认）  节点间直接传数据，不落共享存储  ← 本项目用这个
+#     s3v2          需要 MinIO/S3（finekey 企业版默认）
+#     nas           需要 NFS
 #
-#      代价：polars 加速不可用。11 万行这个量级用 spider 没有实际影响。
-#      真要上大数据量，正确做法是起官方的 master/worker 两容器（各自带 Java 11），
-#      而不是把 Java 11 塞进 web。
+#   官方推荐 s3v2 是因为它在多机、大数据量、worker 可弹性伸缩的场景下
+#   需要一份共享数据面。我们 11 万行、单 worker，sync 完全够，而且
+#   省掉一个 MinIO 容器（约 300MB）。
 #
-# 内存账（详见 docs/note/27-FineBI-与内存预算.md）：
-#   Docker VM 实见        9948 MB
-#   doris-fe + doris-be   3328 MB   ← BI 模式保留，FineBI 要连它查数
-#   本容器                7808 MB   ← 见下面「为什么是 7808」
+# -----------------------------------------------------------------------------
+# 四、为什么不用 OPS_URL（监控子进程）
+# -----------------------------------------------------------------------------
+#   startup.sh 里有个分支：
+#     OPS_URL 非空 → 额外拉起 process agent（crash 监控），再起引擎
+#     OPS_URL 为空 → 直接起引擎
+#   finekey 企业版会注入 OPS_URL 指向 ops-tomcat，那样每个引擎容器会多
+#   一个 -Xmx256m 的监控 JVM。我们不做运维监控，**不设 OPS_URL**，
+#   省一个进程也少一处失败点。
+#
+#   但 worker 自己还会起一个 monitor：
+#     PolarsMonitorServer（-Xmx256M，端口 9000）负责看护 worker 进程
+#     worker（WORKER_EXTRA_VM_OPTIONS 指定的堆，端口 9001）
+#   这个 monitor 去不掉，是 polars 的看护模型，所以要给它留内存。
+#
+# -----------------------------------------------------------------------------
+# 五、内存账（Docker VM 实见 9947MB）
+# -----------------------------------------------------------------------------
+#   doris-fe              1536
+#   doris-be              1792
+#   rt-finebi（web）      7808   ← 见文件后半「为什么是 7808」
+#   rt-finebi-master      2048   ← Xmx768 + 脚本硬编码的直接内存上限 2G
+#   rt-finebi-worker      3584   ← monitor 256 + worker Xmx2048 + 元空间/栈
 #   --------------------------------
-#   限额合计             11136 MB   ← 纸面超卖，靠实测余量兜底
-#   实测占用              fe 657 + be 1514 + finebi 1586 = 3757 MB
-#                         VM 内 MemAvailable 仍剩 5669 MB
+#   限额合计             16768MB   ← 纸面超卖 6.8GB，靠实测兜底
 #
-# 「为什么是 7808」而不是最初写的 5632：
+#   mem_limit 是**保险丝不是预占**。上一轮单容器实测：
+#     fe 657 + be 1514 + web 1586 = 3757MB，VM 里还剩 5669MB。
+#   master 空载约 400MB、worker 空载约 800MB，五容器实测合计约 5GB。
+#   纸面超卖看着吓人，但要真正吃满得同时触发五个容器的峰值，这台机器
+#   的负载（静态快照 + 单用户）不会有那种时刻。
 #
-#   FineBI 自带启动自检，判据是
-#       Xmx + MaxDirectMemorySize + MaxMetaspaceSize + ReservedCodeCacheSize
-#       ≤ 容器内存
-#   不满足就在部署向导页报红字「检测到1项配置异常：JVM参数配置存在问题」
-#   「检测到 xmx + directMemory + metaspace + codecache > 容器/服务器分配的内存」。
+#   如果以后要压，第一刀砍 web 的 MAXDirect/MAXMetaspace（实测这两项
+#   只用到 132MB / 18MB），能把 7808 压到 3456 左右。但这会动 FineBI 的
+#   启动自检判据，得单独验一轮，不在这次范围里。
 #
-#   厂商原串里这三项非堆参数是 2048 + 2048 + 1024 = 5120 MB，加 Xmx 2560
-#   正好 7680 MB —— 所以容器限额的**下限就是 7680**，5632 数学上过不了。
+# -----------------------------------------------------------------------------
+# 六、为什么 worker 的 Xmx 不能小（这是踩出来的）
+# -----------------------------------------------------------------------------
+#   第一版给 worker 配 -Xmx1024m，容器 25 秒后 exit 255，日志里：
 #
-#   厂商原串为什么原样保留（只加了 Xmx 和 IgnoreUnrecognizedVMOptions）：
+#     IllegalArgumentException: The memory size for polars too small : -198642237
+#         at ResourcePlate.start0(ResourcePlate.java:133)
 #
-#   这些值是厂商按 746MB 的 WEB-INF/lib 算出来的，压小省不出实际用量
-#   （实测 Metaspace 只用 132MB、CodeCache 只用 18MB），却会把自检的四项和
-#   压下去的同时也把安全余量压没了。既然最终选择是不动它们、只抬 mem_limit，
-#   那就一个都不改。
+#   值是**负数**。反编译 fine-bi-engine-polars-6.1.jar 之后才看明白：
 #
-#   7808 = 7680 + 128，多出的 128 给 Tomcat native、线程栈和 mmap。
+#     polars.core.memory.system.max.size
+#       默认值 = 单进程 JVM 堆上限（Xmx），作用说明是
+#       「Polars 认为的可使用的内存上限 默认单进程的JVM堆内上限」
+#     polars.core.memory.system.reserve.radio = 0.12
+#       「为系统预留的内存大小，从系统内存中扣除」
+#     polars.spark.memory.ratio = 0.4，且 Math.max(ratio×上限, SPARK_MEMORY_MIN)
+#       SPARK_MEMORY_MIN 实测 1GB —— 这一项是**下限 1GB 硬扣**
+#
+#   所以 Xmx 不是"给 JVM 的堆"，而是 polars 眼里的"整机内存"，它再按比例分：
+#     预留 12% + Spark 引擎 1GB + lake 写入/队列约 6.5%，剩下的才是计算内存。
+#
+#   Xmx=1024 时：
+#     1024 - 122.9 - 1024 - 69.8 = -198.6 MB   ← 与报错值逐字节吻合
+#
+#   反过来解出下限：0.815 × Xmx > 1024（Spark 那 1GB）→ Xmx > 1256MB。
+#   要留出 500MB 以上真实计算空间 → Xmx ≥ 1883MB。所以选 2048。
+#   **这不是"11 万行用不着更大"，是引擎的分账模型不允许更小。**
+#
+#   另一个坑：worker 脚本的 DEFAULT_VM_OPTIONS 只设了
+#   -Dio.grpc.netty.shaded...maxDirectMemory，没有 -XX:MaxDirectMemorySize，
+#   于是直接内存默认等于 Xmx。显式写 2048M 是把这块也钉住，避免它随
+#   Xmx 变动漂移。
 #
 # =============================================================================
 
@@ -82,11 +128,138 @@ name: rt-bi
 
 services:
 
+  # ===========================================================================
+  # 引擎主节点：元数据 + 调度 + worker 注册中心
+  # ===========================================================================
+  finebi-master:
+    image: bi-engine-master:6.1-20261016-6.1.11.1-tomcat-amd64-publish
+    container_name: rt-finebi-master
+
+    # 和 web 一样不自启 —— 切模式时靠脚本显式拉起，避免重启 Docker 后
+    # 五个容器一起醒来抢内存。
+    restart: "no"
+
+    environment:
+      TZ: Asia/Shanghai
+
+      # 角色开关。镜像默认 Env 里已经是这个值，显式写一遍是防镜像升级后
+      # 默认值变动（startup.sh 就是靠它分支到 runMaster / runWorker）。
+      APP_TYPE: bi-engine-master
+
+      # 必须写容器 IP，不能留默认的 127.0.0.1 —— 脚本会把它拼进
+      # -Dpolars.cluster.role.net.host，绑到 loopback 的话 worker 永远连不上。
+      POLARS_HOST: 172.28.0.31
+      POLARS_PORT: "8000"
+
+      # 元数据落盘位置（.polars_meta/polars.properties、conf、gc、dump 都在这下面）
+      POLARS_HOME: /data/polars
+
+      # 容器内必须前台运行，见 /opt/polars/start.sh 的 IS_CONTAINER 分支：
+      # 容器里不能 nohup，否则 PID 1 立刻退出、容器秒退。
+      IS_CONTAINER: "true"
+
+      # 堆。master 只做调度和元数据，不扫数据，768MB 足够。
+      # 脚本另有一行硬编码 -XX:MaxDirectMemorySize=2147483648（gRPC/Netty 用），
+      # 那是上限不是预占，所以 mem_limit 给 2048m 而不是 768+2048。
+      MASTER_EXTRA_VM_OPTIONS: "-Xmx768m"
+
+      # 故意不设 OPS_URL —— 见文件头「四」。设了会多起一个 256MB 的监控 JVM。
+
+    volumes:
+      # master 的元数据卷。丢了这个卷不会丢业务数据（BI 的报表定义在 web 侧），
+      # 只是集群重新初始化一遍。
+      - rt-finebi-master:/data/polars
+
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.31
+
+    # 硬上限。master 只做调度 + 元数据，不扫数据：
+    #   Xmx768 + 脚本写死的 -XX:MaxDirectMemorySize=2G（上限，不预占）+ 元空间/栈
+    # 实测空载 398MB，给 2048 是留足 gRPC 突发。
+    mem_limit: 2048m
+
+    # 探 8000 端口而不是探进程名 —— pgrep 在这种精简镜像里不一定有，
+    # bash 的 /dev/tcp 一定在。start_period 给足：要加载 357MB 的 jar。
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8000' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+
+  # ===========================================================================
+  # 引擎工作节点：真正跑查询和数据加载
+  # ===========================================================================
+  # 它会起两个 JVM：
+  #   PolarsMonitorServer  :9000  -Xmx256M  （看护者，会被 it 派生的 worker 挂掉后拉起）
+  #   Worker               :9001  -Xmx1024M （干活的那个）
+  finebi-worker:
+    image: bi-engine-worker:6.1-20261016-6.1.11.1-tomcat-amd64-publish
+    container_name: rt-finebi-worker
+
+    restart: "no"
+
+    # worker 要靠 master 的元数据注册，但**不用 depends_on 的 healthcheck 条件**：
+    # 那会让 compose up 卡住等 master healthy，日志不友好；worker 自己有重试，
+    # 由脚本按顺序起更直观（switch-mode.sh 会先起 master 再起 worker）。
+    depends_on:
+      finebi-master:
+        condition: service_started
+
+    environment:
+      TZ: Asia/Shanghai
+
+      APP_TYPE: bi-engine-worker
+
+      POLARS_HOST: 172.28.0.32
+      POLARS_PORT: "9001"
+
+      POLARS_HOME: /data/polars
+      IS_CONTAINER: "true"
+
+      # 集群单 master 模式的三个坐标。名字要和 master 侧的 MASTER_NAME 对上
+      # （默认都是 "Master"），host/port 是 master 容器的地址。
+      ENV_MASTER_HOST: 172.28.0.31
+      ENV_MASTER_PORT: "8000"
+      ENV_MASTER_NAME: Master
+
+      # 存储层。sync = 节点间直接传，不需要 MinIO。见文件头「三」。
+      # 显式写出来是为了防止镜像将来把默认值改成 s3v2。
+      ENV_POLARS_TIERS: sync
+
+      # worker 的堆。**不能小**，原因见下面「为什么 2048 是下限」。
+      WORKER_EXTRA_VM_OPTIONS: "-Xmx2048m -XX:MaxDirectMemorySize=2048M"
+
+    volumes:
+      - rt-finebi-worker:/data/polars
+
+    # 硬上限。构成：
+    #   worker  JVM   Xmx2048 + 堆外直连 2048（上限，实占远小于此）+ 元空间/栈 ≈ 2600
+    #   monitor JVM   -Xmx256M（脚本写死）+ 堆外 ≈ 350
+    #   两个 JVM 同容器，限额必须覆盖两者之和，给 3584 留余量。
+    mem_limit: 3584m
+
+    networks:
+      rt-net:
+        ipv4_address: 172.28.0.32
+
+    # 探 worker 的 9001，不探 monitor 的 9000 —— 9000 活着不代表 worker 活着，
+    # 恰恰是 worker 挂了才由 monitor 去拉，探它会给出假阳性。
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/9001' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 120s
+
+  # ===========================================================================
+  # Web 入口：Tomcat + 页面 + 配置库 + spider 单机引擎（作为兜底）
+  # ===========================================================================
   finebi:
     image: bi-web:6.1-20261016-6.1.11.1-tomcat-amd64-publish
     container_name: rt-finebi
 
-    # 不让它开机自启。BI 模式和 realtime 模式互斥，自启会抢内存。
     restart: "no"
 
     # HSQLDB 写 checkpoint 时被杀会留脏页，下次启动要做恢复。
@@ -116,17 +289,6 @@ services:
       # Xmx2560m 的依据：DWD 112,650 行 / DWS 88,157 行，2.5G 堆绰绰有余。
       # 官方"建议 8G ≤ Xmx"是按企业级并发和大表算的，本项目用不到；
       # 但要知道这是**低于官方下限**的选择，不是官方推荐配置，别对外这么说。
-      #
-      # 注意这四项是"上限"不是"预占"，实测空载只占 1.59 GB。
-      # 但它们的**和** 2560 + 2048 + 2048 + 1024 = 7680 MB 正是 FineBI
-      # 启动自检的判据，必须 ≤ 容器限额 —— mem_limit 因此定为 7808m。
-      #
-      # 第一行的 IgnoreUnrecognizedVMOptions 是为 Java 11 准备的：
-      # /docker-entrypoint.sh 里硬拼了 -XX:+PrintGCDateStamps 和
-      # -XX:+UseGCLogFileRotation（JDK 9 就移除了），不忽略的话 JVM 直接
-      # "Unrecognized VM option" 起不来。加上它之后这两个参数被静默跳过，
-      # 而 -Xloggc / -XX:+PrintGCDetails 在 Java 11 是 deprecated 别名，
-      # 自动映射成 -Xlog:gc，GC 日志照常输出（实测，见 note/27 §2.7）。
       # ---------------------------------------------------------------------
       JAVA_OPTS: >-
         -XX:+IgnoreUnrecognizedVMOptions
@@ -135,17 +297,18 @@ services:
         -XX:PerBytecodeRecompilationCutoff=-1 -XX:PerMethodRecompilationCutoff=-1
         -Xms1024m -Xmx2560m
         -XX:MaxDirectMemorySize=2048M
-        -XX:ReservedCodeCacheSize=250M
+        -XX:ReservedCodeCacheSize=1024m
         -XX:MaxMetaspaceSize=2048m
         -Dfineio.read_mem_limit=2 -Dfineio.write_mem_limit=1
         -Dsun.zip.disableMemoryMapping=true
         -XX:+UseParallelGC
-        -XX:ReservedCodeCacheSize=1024m
 
     # 硬上限。超了 OOMKill，不会拖垮 Doris。
-    # 7808 的下限来自 FineBI 的 JVM 参数自检（见文件头「为什么是 7808」）。
-    # 1536 + 1792 + 7808 = 11136MB > VM 9948MB，属于**纸面超卖**：
-    # mem_limit 是保险丝不是预占，实测三容器合计只用 3757MB。
+    # 7808 的下限来自 FineBI 的 JVM 参数自检：
+    #   Xmx + MaxDirectMemory + MaxMetaspace + ReservedCodeCache
+    #   = 2560 + 2048 + 2048 + 1024 = 7680，必须 ≤ 容器限额。
+    # 不够就在部署向导页报「JVM参数配置存在问题」，比现在的引擎错误更靠前。
+    # 7808 = 7680 + 128（给 Tomcat native、线程栈、mmap）。
     mem_limit: 7808m
 
     # -------------------------------------------------------------------------
@@ -161,30 +324,9 @@ services:
     volumes:
       - rt-finebi-webroot:/usr/local/tomcat/webapps/webroot
 
-      # ---------------------------------------------------------------------
-      # 注意：这里**没有**挂 Java 11。
-      #
-      # 试过把 rt-java11 挂到 /opt/java/openjdk 覆盖镜像自带的 Java 8，
-      # 结果一路踩坑，最后确认这条路不通：
-      #   1. entrypoint 硬拼 -XX:+PrintGCDateStamps（JDK 9 已移除）→ JVM 起不来
-      #      加 -XX:+IgnoreUnrecognizedVMOptions 可绕过
-      #   2. FineAssist 是 JNI native agent（native int signature()），
-      #      .so 按 Java 8 编译；加 -Djdk.attach.allowAttachSelf=true 让它
-      #      attach 成功后，反而出现随机的 ClassFormatError
-      #      （Incompatible magic value，每次数值和类名都不同）
-      #   3. fine-core-11.0.jar 里有 com/fr/plugin/bridge/*.classx ——
-      #      厂商的类加密格式，Java 11 下解密封装失效，密文被当 class 读
-      #
-      # 结论：bi-web 镜像是**绑定 Java 8** 的（类解密 + native agent 都依赖它），
-      # 而 polars 引擎是 Java 11 编译的。厂商把两者拆成独立镜像不是选择，是必然。
-      # 想回滚试 Java 11：把下面 rt-java11 那行加回来。
-      # ---------------------------------------------------------------------
-      # - rt-java11:/opt/java/openjdk
-
     networks:
       rt-net:
-        # 172.28.0.10~.21 已被数仓占，.30 留给自己。
-        # 固定 IP 是为了让接数据源时能写死 doris-fe:9030 之外还有个确定地址。
+        # 172.28.0.10~.21 已被数仓占，.30~.32 归 FineBI 三个容器。
         ipv4_address: 172.28.0.30
 
     # 镜像自带 healthcheck（/opt/fineops/bin/healthcheck.sh，5s 间隔 3 次重试），
@@ -209,16 +351,21 @@ volumes:
   rt-finebi-webroot:
     name: rt-finebi-webroot
 
-  # Java 11 运行时，从 bi-engine-worker 镜像原样拷出（268MB）。
-  #
-  # external: true —— 这个卷不是 compose 造出来的，是手工准备的运行时。
-  # 不加 external 的话 `down -v` 会把它一起删掉，下次启动就得重新拷 268MB。
-  #
-  # 丢了怎么重建（一条命令）：
-  #   docker volume create rt-java11
-  #   docker run --rm --entrypoint sh -v rt-java11:/dest \
-  #     bi-engine-worker:6.1-20261016-6.1.11.1-tomcat-amd64-publish \
-  #     -c 'cp -a /opt/java/openjdk/. /dest/'
-  rt-java11:
-    name: rt-java11
-    external: true
+  # 引擎节点各自的元数据目录。不共享 —— polars 的 sync 模式靠节点间同步，
+  # 共享磁盘反而会让两个进程抢同一份 .polars_meta。
+  rt-finebi-master:
+    name: rt-finebi-master
+
+  rt-finebi-worker:
+    name: rt-finebi-worker
+
+  # 注：这里原本有个 rt-java11 卷（把 worker 镜像的 JDK 11 拷出来挂给 web），
+  # 已删除。原因不是省空间，是那条路根本走不通：
+  #   · entrypoint 硬拼 -XX:+PrintGCDateStamps（JDK 9 已移除）
+  #   · FineAssist 是 JNI native agent，.so 按 Java 8 编，换 JDK 后随机
+  #     ClassFormatError: Incompatible magic value
+  #   · fine-core-11.0.jar 里 com/fr/plugin/bridge/*.classx 是厂商加密格式，
+  #     Java 11 下解密封装失效，密文被当 class 读
+  # 结论：bi-web 镜像**绑定 Java 8**，polars 引擎**绑定 Java 11**，
+  # 这是两个进程而不是一个 JVM —— 也正因如此才有 master/worker 两个容器。
+  # 完整复盘见 docs/note/27 §2.4。

@@ -59,19 +59,30 @@ docker/
     └── be.conf           # Doris BE 的配置覆盖，只读挂到 /opt/apache-doris/be/conf/be.conf
 ```
 
-> **`docker-compose.finebi.yml` 为什么不写进主 compose**：FineBI 的 JVM 自检要求
+> **`docker-compose.finebi.yml` 为什么不写进主 compose**：它开三个容器
+> （web + engine-master + engine-worker），web 的 JVM 自检要求
 > `Xmx + Direct + Metaspace + CodeCache ≤ 容器内存`，厂商那四项加起来 7680MB，
-> 所以它的 `mem_limit` 下限就是 7808MB；而主栈 6 个容器已经占了
-> 8960MB / 9947MB，两套加起来远超 VM。所以它是一份独立的 compose，
-> 用独立的项目名 `rt-bi`（否则两边互相报 `orphan containers`），共用 `rt-net` 网络
-> （`external: true`）才能用 `doris-fe:9030` 这个服务名接数据源。
+> 所以 web 的 `mem_limit` 下限就是 7808MB；worker 因为 polars 的分账模型
+> `Xmx ≥ 1883MB`，限额也顶到 3584MB。三项合计已超过 VM 的一半，
+> 而主栈 6 个容器占了 8960MB / 9947MB，两套加起来远超 VM。所以它是一份独立的
+> compose，用独立的项目名 `rt-bi`（否则两边互相报 `orphan containers`），
+> 共用 `rt-net` 网络（`external: true`）才能用 `doris-fe:9030` 这个服务名接数据源。
 >
-> 另外：容器里的 **polars 引擎 jar 是被移除的**（`WEB-INF/lib.disabled/`）。
-> `bi-web` 绑定 Java 8、polars 引擎绑定 Java 11，同一个 JVM 装不下，只留内置 spider 引擎。
+> 三个容器的启动有顺序：**master 先 healthy，worker 才注册得上去**。
+> worker 一启动就连 `master:8000`，连不上它的 monitor 直接 `exit 66` 不重试。
+> 用 `scripts/switch-mode.sh bi` 会自动按顺序起并逐个等就绪。
+>
+> 另外：web 容器里的 **polars jar 是被移除的**（`WEB-INF/lib.disabled/`）。
+> `bi-web` 绑定 Java 8（class 52），而 polars 的实现类（包括"进程内迷你集群"模式
+> 用的 `BIWorkerModule`）全是 class 55。放回去 web 会在
+> `LocalMiniProcessStart` 处 `ClassNotFoundException` 并 shutdown。
 > **卷重建后要重新移除一次**，命令见 `docs/note/27` §3.2。
 >
+> 这意味着 master/worker 的集群是真的在跑，但 web 用不上它 —— 部署向导会一直停在
+> 「引擎」这一步报 `BI-Design_Engine_Error`。要用 FineBI 界面的只能走官网单机版安装包。
+>
 > 切换用 `bash scripts/switch-mode.sh bi|realtime`。实测数据和选型依据见
-> [`docs/note/27-FineBI-与内存预算.md`](../docs/note/27-FineBI-与内存预算.md)。
+> [`docs/note/27-FineBI-与内存预算.md`](../docs/note/27-FineBI-与内存预算.md) §2.11。
 
 > **`be-conf/` 是唯一进 git 的配置目录**，因为它改的是运行行为而不是运行数据
 > （`volumes/` 整个被忽略）。目前里面只有一处改动：`trash_file_expire_time_sec = 3600`。
