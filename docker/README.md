@@ -50,6 +50,7 @@ docker compose --profile olap    up -d    # 最后起 Doris
 ```
 docker/
 ├── docker-compose.yml
+├── docker-compose.finebi.yml   # 可选：FineBI 分析模式（独立项目名 rt-bi，与主栈二选一）
 ├── .env.example          # 端口、密码、内存 limit 等可覆盖变量（.env 本身不入库）
 ├── volumes/              # 容器数据目录：mysql/、kafka/、doris-fe/、doris-be/（整目录不入库）
 ├── flink/
@@ -57,6 +58,14 @@ docker/
 └── be-conf/
     └── be.conf           # Doris BE 的配置覆盖，只读挂到 /opt/apache-doris/be/conf/be.conf
 ```
+
+> **`docker-compose.finebi.yml` 为什么不写进主 compose**：FineBI 单容器空载要 1540MB，
+> 而主栈 6 个容器已经占了 8960MB / 9947MB，装不下。所以它是一份独立的 compose，
+> 用独立的项目名 `rt-bi`（否则两边互相报 `orphan containers`），共用 `rt-net` 网络
+> （`external: true`）才能用 `doris-fe:9030` 这个服务名接数据源。
+>
+> 切换用 `bash scripts/switch-mode.sh bi|realtime`。实测数据和选型依据见
+> [`docs/note/27-FineBI-与内存预算.md`](../docs/note/27-FineBI-与内存预算.md)。
 
 > **`be-conf/` 是唯一进 git 的配置目录**，因为它改的是运行行为而不是运行数据
 > （`volumes/` 整个被忽略）。目前里面只有一处改动：`trash_file_expire_time_sec = 3600`。

@@ -15,7 +15,8 @@ scripts/
 ├── demo-change.sh        # 改一行 MySQL，量出它走到大屏要多久（含僵尸自检）
 ├── calibrate_late_ratio.py  # 给 late_ratio 做正向对照（注入已知比例的迟到事件）
 ├── check_lag.py          # 端到端延迟真采样 → P50/P95/P99
-└── stop.sh               # 安全关停：停大屏 → 按依赖倒序停容器 → 打印怎么再开
+├── stop.sh               # 安全关停：停大屏 → 按依赖倒序停容器 → 打印怎么再开
+└── switch-mode.sh        # 实时数仓模式 / BI 分析模式二选一（内存只够跑一套）
 ```
 
 ## 依赖
@@ -450,3 +451,45 @@ flink-tm → flink-jm → doris-be → doris-fe → kafka → mysql
 容器起来不等于作业在跑。Docker 重启会丢掉整个 Flink session，4 个作业一个都不在。
 重启走 `bash scripts/demo.sh --no-dashboard`（幂等，会补提作业），
 然后**等 07 的快照跑完**（41 万行，1~2 分钟）再验收：`RUNNING` 不等于在产出。
+
+## `switch-mode.sh`
+
+```bash
+bash scripts/switch-mode.sh                  # 看当前模式 + 内存账（同 status）
+bash scripts/switch-mode.sh bi               # BI 模式：只留 Doris，起 FineBI
+bash scripts/switch-mode.sh realtime         # 实时模式：起 6 容器，停 FineBI
+bash scripts/switch-mode.sh realtime --submit  # 顺带把 4 个作业提起来
+```
+
+### 为什么是"切换"而不是"共存"
+
+Docker VM 实见 9947MB，实时模式 6 个容器限额已经是 8960MB，只剩 987MB 余量。
+FineBI 单容器空载就要 1540MB。两套同时开必然超。
+
+于是把 FineBI 也配成 8960MB 一档，两种模式峰值一致：
+
+| 模式 | 组成 | 限额 |
+| --- | --- | --- |
+| realtime | mysql + kafka + fe + be + jm + tm | 8960MB |
+| bi | fe + be + finebi | 8960MB |
+
+### BI 模式为什么能砍掉 Flink 和 Kafka
+
+数据已经落在 Doris 里了。停 Flink 只是不再"继续计算"，不是丢数据——
+`dwd_trade_order_detail` 112,650 行、`dws_trade_overview_1m` 88,157 行一行不少。
+
+代价是 Doris 里变成**静态快照**，BI 模式下不会更新。要"实时"就切回 realtime。
+
+### 停的顺序：Flink 先走
+
+`flink-tm → flink-jm → kafka → mysql`。先停 Flink 是因为它每 10s 往 Doris 写一批，
+先断写端再断上下游；反过来停会让 Flink 报一串 connection refused 再自己退出，
+日志脏，且 checkpoint 可能失败。
+
+### 没动的东西
+
+- 不动 `.wslconfig`。提到 12GB 能让两套共存，但 Windows 只剩 3.6GB，内存压缩会先拖慢整机
+- 不删任何卷。切模式只 `stop`，任何分支都不带 `-v`
+- 不改 finekey 那套 23 镜像的编排。FineOps 企业版官方最低 64GB，跑不动
+
+细节和实测数据见 `docs/note/27-FineBI-与内存预算.md`。

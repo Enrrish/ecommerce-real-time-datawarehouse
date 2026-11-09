@@ -1,0 +1,140 @@
+# =============================================================================
+# FineBI 6.1 —— 单容器分析模式（方案 D：与实时数仓二选一）
+# -----------------------------------------------------------------------------
+# 这个文件是独立的 compose，与 docker-compose.yml 互不影响：
+#   起：docker compose -f docker-compose.finebi.yml up -d
+#   停：docker compose -f docker-compose.finebi.yml down
+# 用 scripts/switch-mode.sh 切换更省事（它会顺手算内存账）。
+#
+# 为什么只跑 bi-web 一个容器，不跑 finekey 那套 23 个镜像？
+#
+#   1. 那个 13GB 的包是 FineOps 企业版**集群**编排包，不是"一个 BI 镜像"。
+#      官方最低配置方案是 16 核 / 64G 内存，且强制部署
+#      1×bi-web + 1×bi-engine-master + 1×bi-engine-worker + 1×bi-minio，
+#      外加 nginx / mysql 配置库 / es 日志存储。64G 是这台机器的 4 倍。
+#
+#   2. 官方最低档面向的是"日活 50 人、单表 500 万行、表数 500"的企业规模。
+#      本项目 DWD 112,650 行、DWS 88,157 行，差了 45 倍，不需要那个架构。
+#
+#   3. bi-web 的 WEB-INF/lib 里有 fine-bi-engine-spider-6.1.jar —— 这是
+#      **内置计算引擎**，本地就能算。而 polars 只是 fine-bi-engine-polars-client
+#      （一个客户端 jar），真正的引擎在 bi-engine-master/worker 里。
+#      所以单体 web 跑基础分析是完整的，polars 三件套是给大数据量加速的。
+#
+#   4. 6.1 而不是 7.5：7.x 把指标中心/引擎彻底服务化，官方没有单容器形态；
+#      6.1 保留内置 spider 引擎，能单跑。这是选 6.1 的唯一理由。
+#
+# 内存账（详见 docs/note/27-FineBI-与内存预算.md）：
+#   Docker VM 实见        9715 MB
+#   doris-fe + doris-be   3328 MB   ← BI 模式保留，FineBI 要连它查数
+#   本容器                5632 MB
+#   --------------------------------
+#   合计                  8960 MB   余 755 MB 给 page cache 和内核
+#
+# =============================================================================
+
+# 独立的项目名。不写的话 compose 会按目录名（docker/）推断，于是和
+# docker-compose.yml 撞成同一个项目 —— 两边每次 up 都会互相警告
+# "Found orphan containers (rt-finebi)" / "(rt-flink-tm, rt-doris-be, …)"，
+# 而且一个项目的 `down --remove-orphans` 会把另一个项目的容器当垃圾删掉。
+name: rt-bi
+
+services:
+
+  finebi:
+    image: bi-web:6.1-20261016-6.1.11.1-tomcat-amd64-publish
+    container_name: rt-finebi
+
+    # 不让它开机自启。BI 模式和 realtime 模式互斥，自启会抢内存。
+    restart: "no"
+
+    # HSQLDB 写 checkpoint 时被杀会留脏页，下次启动要做恢复。
+    # 默认 10s 太短，和 mysql 那边同理给 60s。
+    stop_grace_period: 60s
+
+    ports:
+      # 宿主 9080（8080 被大屏后端占着，别撞）
+      - "${FINEBI_PORT:-9080}:8080"
+
+    environment:
+      TZ: Asia/Shanghai
+
+      # ---------------------------------------------------------------------
+      # JAVA_OPTS 必须整串重写，因为 docker 的 -e 是**替换**不是追加。
+      # 镜像自带的串里没有 -Xmx —— 不给的话 JVM 走容器感知默认值
+      # （MaxRAMPercentage 25%），等于把堆上限交给容器限额去推，不好控制。
+      #
+      # 为什么下面几乎照抄了镜像原串：实测过，缩减这些参数会让容器起不来。
+      # 我按"节约"的思路压到 MaxMetaspace=512m / CodeCache=256m /
+      # Direct=1024m / fineio.read=1，结果进程在 cluster 模块初始化后
+      # 静默 exit 1（没有异常栈，FineLog 里也没业务日志，只有 gc/safepoint）。
+      # 换成"厂商原串 + 只加 Xmx"就 25 秒 healthy。
+      # 逐项二分太费时，且这些值本就是厂商按 746MB 的 WEB-INF/lib 算出来的，
+      # 不与它较劲：**只加一个 Xmx 把堆钉住，其余照抄**。
+      #
+      # Xmx2560m 的依据：DWD 112,650 行 / DWS 88,157 行，2.5G 堆绰绰有余。
+      # 官方"建议 8G ≤ Xmx"是按企业级并发和大表算的，本项目用不到；
+      # 但要知道这是**低于官方下限**的选择，不是官方推荐配置，别对外这么说。
+      #
+      # 注意 MaxDirectMemorySize=2048M + MaxMetaspaceSize=2048m +
+      # ReservedCodeCacheSize=1024m 是"上限"不是"预占"，实测空载只占 1.55GB。
+      # 但理论上限合计 heap 2560 + 其它 5120 ≈ 7.5G > 容器限额，
+      # 所以真要跑重负载，先看 docs/note/27 里的"超限预案"再动 mem_limit。
+      # ---------------------------------------------------------------------
+      JAVA_OPTS: >-
+        -server
+        -Duser.country=CN -Duser.language=zh -Djava.awt.headless=true
+        -XX:PerBytecodeRecompilationCutoff=-1 -XX:PerMethodRecompilationCutoff=-1
+        -Xms1024m -Xmx2560m
+        -XX:MaxDirectMemorySize=2048M
+        -XX:ReservedCodeCacheSize=250M
+        -XX:MaxMetaspaceSize=2048m
+        -Dfineio.read_mem_limit=2 -Dfineio.write_mem_limit=1
+        -Dsun.zip.disableMemoryMapping=true
+        -XX:+UseParallelGC
+        -XX:ReservedCodeCacheSize=1024m
+
+    # 硬上限。超了 OOMKill，不会拖垮 Doris。
+    # 5632 + doris-fe 1536 + doris-be 1792 = 8960MB，VM 实见 9715MB，余 755MB。
+    mem_limit: 5632m
+
+    # -------------------------------------------------------------------------
+    # 持久化：整个 webroot 挂一个命名卷
+    # -------------------------------------------------------------------------
+    # FineBI 会往十几个子目录写状态（embed 里的 HSQLDB 配置库、bi-data、
+    # config、assets、plugins、dpworks、schedule、backup…），逐个挂卷太脆。
+    # 挂整个 webroot 的代价是：镜像升级后旧卷里还是旧 jar，想更新得删卷重建。
+    # 对"做个分析演示"这个用途，换来的"重启不丢工程"更值。
+    #
+    # 首次启动时 docker 会把镜像里的 webroot 复制进空卷（约 1.5GB），
+    # 所以第一次 up 会慢 30~60 秒，之后正常。
+    volumes:
+      - rt-finebi-webroot:/usr/local/tomcat/webapps/webroot
+
+    networks:
+      rt-net:
+        # 172.28.0.10~.21 已被数仓占，.30 留给自己。
+        # 固定 IP 是为了让接数据源时能写死 doris-fe:9030 之外还有个确定地址。
+        ipv4_address: 172.28.0.30
+
+    # 镜像自带 healthcheck（/opt/fineops/bin/healthcheck.sh，5s 间隔 3 次重试），
+    # 但没给 start_period —— 实测启动要 24 秒，前 15 秒必然连红 3 次被标 unhealthy。
+    # 补一个 start_period 让它安静地启动。
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/fineops/bin/healthcheck.sh"]
+      interval: 10s
+      timeout: 6s
+      retries: 3
+      start_period: 120s
+
+networks:
+  # 复用数仓那张网，FineBI 才能用 doris-fe:9030 这个服务名解析。
+  # external: true 表示"这张网由别的 compose 管，我只接上去"，所以
+  # 必须先起过一次数仓（至少 doris-fe / doris-be），否则这里会报网络不存在。
+  rt-net:
+    external: true
+    name: rt-net
+
+volumes:
+  rt-finebi-webroot:
+    name: rt-finebi-webroot
