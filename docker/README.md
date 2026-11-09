@@ -59,8 +59,10 @@ docker/
     └── be.conf           # Doris BE 的配置覆盖，只读挂到 /opt/apache-doris/be/conf/be.conf
 ```
 
-> **`docker-compose.finebi.yml` 为什么不写进主 compose**：FineBI 单容器空载要 1540MB，
-> 而主栈 6 个容器已经占了 8960MB / 9947MB，装不下。所以它是一份独立的 compose，
+> **`docker-compose.finebi.yml` 为什么不写进主 compose**：FineBI 的 JVM 自检要求
+> `Xmx + Direct + Metaspace + CodeCache ≤ 容器内存`，厂商那四项加起来 7680MB 且一项
+> 都压不得，所以它的 `mem_limit` 下限就是 7808MB；而主栈 6 个容器已经占了
+> 8960MB / 9947MB，两套加起来远超 VM。所以它是一份独立的 compose，
 > 用独立的项目名 `rt-bi`（否则两边互相报 `orphan containers`），共用 `rt-net` 网络
 > （`external: true`）才能用 `doris-fe:9030` 这个服务名接数据源。
 >

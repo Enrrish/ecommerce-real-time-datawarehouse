@@ -3,6 +3,10 @@
 > 这篇记录一次真实的技术选型：拿到一个 13GB 的「FineBI 离线部署包」，要判断这台 16GB 的机器能不能跑，
 > 最后怎么跑。结论是**能跑，但不是按包的设计意图跑**——包里那套东西的官方最低配置是 64GB。
 >
+> 中途踩了两个坑，都在正文里留了完整复盘：一是 `bi-web` 单镜像**缺一个 341MB 的引擎 jar**
+> （厂商发布包的结构问题，`docker logs` 会骗人）；二是它的**启动自检**要求
+> 四项 JVM 内存参数之和不超过容器限额，因此 `mem_limit` 有个 7808MB 的硬下限。
+>
 > 全文只有两个数字来源：帆软官方文档，和本机实测。凡是估的都会写明是估的。
 
 ---
@@ -79,7 +83,7 @@ FineBI 容器，空载只占 **1.54GB**。所以：
 
 ### 1.3 容器内存限额与 OOMKill
 
-`docker run --memory=5632m` 是 **cgroup 硬上限**，超了内核直接 SIGKILL，
+`docker run --memory=7808m` 是 **cgroup 硬上限**，超了内核直接 SIGKILL，
 退出码 **137**（128 + 9）。这和 JVM 自己抛 `OutOfMemoryError` 是两回事：
 
 | 现象 | 退出码 | 日志 | 含义 |
@@ -89,7 +93,8 @@ FineBI 容器，空载只占 **1.54GB**。所以：
 | Metaspace 不够 | 1 | `OutOfMemoryError: Metaspace` | 类加载太多 |
 | **进程主动 exit** | **1** | **可能什么都没有** | 应用自己的逻辑 |
 
-最后一行是这篇要重点讲的坑——见 §2.4。
+最后一行是这篇要重点讲的坑——见 §2.4。注意"可能什么都没有"通常不是真的没有，
+而是**日志被应用重定向到了另一个文件**，`docker logs` 看不到而已。
 
 ### 1.4 Compose 多项目共存
 
@@ -176,99 +181,195 @@ CPU 16 核 / 内存 64GB / 磁盘 500GB
 
 **64GB 是这台机器的 4 倍。** 而且引擎节点是强制的，不能只起 web（见 §2.3 的证据）。
 
-### 2.3 只起 bi-web 行不行？——不行，但有个例外
+### 2.3 只起 bi-web 行不行？——不行，它缺一个 341MB 的 jar
 
 把 `bi70all` 和 `bi61all` 都 load 进来，各得到 4 个镜像。看 `bi-web` 里有什么：
 
 ```bash
 $ docker run --rm --entrypoint sh bi-web:6.1-… -c 'ls /opt/polars; du -sh /opt/polars'
 arthas
-8.0K    /opt/polars          # 只有诊断工具，没有引擎
+8.0K    /opt/polars          # 只有线程诊断工具，不是引擎
 
 $ docker run --rm --entrypoint sh bi-engine-master:6.1-… -c 'du -sh /opt/polars'
-32M     /opt/polars          # 这里才是引擎
+32M     /opt/polars          # 启动脚本 + 日志配置，也没有引擎本体
 ```
 
-但 `bi-web` 的 `WEB-INF/lib` 里有这么几个 jar：
+引擎本体在 worker 镜像的 `WEB-INF/lib` 里。把两个镜像的 jar 列表做差集，结果干净得意外：
 
+```bash
+$ comm -13 web-jars.txt worker-jars.txt        # worker 有、web 没有
+fine-bi-engine-polars-6.1.jar
+
+$ comm -23 web-jars.txt worker-jars.txt | head
+fine-accumulator-11.0.jar
+fine-bi-adapter-6.1.jar
+fine-bi-engine-polars-client-6.1.jar           # ← 关键就是它
+fine-cbb-11.0.jar
+...
 ```
-fine-bi-engine-spider-6.1.jar        ← 内置计算引擎（FineBI 5.x 起就有）
-fine-bi-engine-polars-client-6.1.jar ← polars 只是个**客户端**
-fine-bi-spider-cluster-6.1.jar
-```
 
-**结论：`bi-web` 自带 `spider` 引擎，能独立做基础分析；`polars` 三件套是给大数据量加速的。**
-这就是本文选 6.1 单容器的依据——不是为了省镜像数，是因为它真的能单跑。
+**`worker 的 lib = web 的 lib − client 版 + engine 版`**，34 个 jar 只差这一个：
 
-### 2.4 一次静默退出，和它教我的事
-
-第一版 compose 我按"节约"的思路把厂商默认参数全压了一轮：
-
-| 参数 | 厂商默认 | 我压到 |
+| jar | 体积 | 内容 |
 | --- | --- | --- |
-| `MaxDirectMemorySize` | 2048M | 1024M |
-| `MaxMetaspaceSize` | 2048m | 512m |
-| `ReservedCodeCacheSize` | 1024m | 256M |
-| `fineio.read_mem_limit` | 2 | 1 |
+| `fine-bi-engine-polars-client-6.1.jar` | 134.9 MB | 9,287 个 polars 条目，**只有客户端 API** |
+| `fine-bi-engine-polars-6.1.jar` | 340.8 MB | **175,922 个条目**，含整个 `com/fanruan/polars/bi/` 引擎包 |
 
-结果：容器启动约 20 秒后**退出码 1，日志里没有异常栈**：
+抽查 `SessionProvider` / `BlockPipelineDataSource` / `Config$ServerMode` 三个类，engine 版里全有
+—— 它是 client 版的**超集**，所以该**替换**而不是叠加。
+
+`bi-web` 只拿到 client 版，但它启动时会走 `LocalMiniProcessStart`（在同一 JVM 里起 mini polars
+集群），那条路径要反射加载 engine 版里的 `com.fanruan.polars.bi.BIWorkerModule`。找不到就抛
+`ClassNotFoundException`，再触发全局 shutdown（详见 2.4 的日志）。
+
+**修法**：把 worker 的 engine jar 换进 web 的 `WEB-INF/lib`。
+
+```bash
+# 1. 从 worker 镜像取 jar（341MB，约 3 秒）
+docker create --name tmp-w bi-engine-worker:6.1-…
+docker cp tmp-w:/usr/local/tomcat/webapps/webroot/WEB-INF/lib/fine-bi-engine-polars-6.1.jar .
+docker rm tmp-w
+
+# 2. 替换卷里的 client 版（保留 jar 总数 35 个不变）
+docker run --rm -v "D:/…:/src:ro" -v rt-finebi-webroot:/w alpine sh -c '
+  rm -f /w/WEB-INF/lib/fine-bi-engine-polars-client-6.1.jar
+  cp /src/fine-bi-engine-polars-6.1.jar /w/WEB-INF/lib/
+'
+```
+
+换完 `docker logs` 里 `polars mini cluster error` 从有到无，重启两次都是 25 秒 healthy。
+
+> 这是发布包的结构问题，不是配置错误：引擎类只打在 worker 镜像里，而 `bi-web` 的
+> `LocalMiniProcessStart` 写死了要加载它。官方推荐的四容器部署（web + master + worker + minio）
+> 下引擎由 worker 提供，踩不到这条路；单容器属于非预期用法，所以厂商没覆盖到。
+
+### 2.4 那次"静默退出"，真凶是缺类，不是参数
+
+第一版 compose 起容器，20 秒后**退出码 1**，`docker logs` 停在：
 
 ```
 2026/11/09 09:43:29 main INFO [com.finebi.cluster] [ClusterModule] cluster update activator start
-（到此为止）
+BIDiskFull: proxied System.out and System.err
 ```
 
-排查过程：
+当时判断是"JVM 参数压得太狠"——因为换成厂商原串就起来了。**这个结论是错的。**
 
-1. 先怀疑是挂卷导致的 —— 去掉卷重跑，**一样退**
-2. 再怀疑是堆参数 —— 换成**镜像默认 JAVA_OPTS**（一个都不改），**起来了，20 秒 healthy**
+**误导点一**：`BIDiskFull: proxied System.out and System.err` 不是"磁盘满"，
+是 FineBI 把 `System.out` / `System.err` **重定向到日志文件**的通知。从这一行之后
+`docker logs` 就看不到应用日志了 —— **"日志断在 cluster start"是假象，不是退出点**。
 
-于是二分。最终结论：**厂商那串参数不能随便砍**，换成"原串 + 只加 `-Xmx`"就正常：
+**误导点二**：真日志在容器里的 `logs/fanruan.log`，不在 stdout：
+
+```bash
+docker cp rt-finebi:/usr/local/tomcat/logs D:/tmp/
+tail -20 D:/tmp/logs/fanruan.log
+```
 
 ```
-厂商原串 + -Xms1024m -Xmx2560m   →  25 秒 healthy，空载 1.547GiB
+ERROR [standard]  start polars mini cluster error. Please check error message
+com.fr.invoke.ReflectException: java.lang.ClassNotFoundException: com.fanruan.polars.bi.BIWorkerModule
+    at com.finebi.adapt.polars.impl.polars.mini.BIWorkerModule.registerInProcess(BIWorkerModule.java:14)
+    at com.finebi.adapt.polars.impl.polars.LocalMiniProcessStart.start(LocalMiniProcessStart.java:114)
+    at com.finebi.spider.impl.startup.PolarsModule.start(PolarsModule.java:163)
+    at com.finebi.direct.impl.datasource.ExcelDataSourceEngineDriver.init(ExcelDataSourceEngineDriver.java:63)
+    ...
+CacheManager-GlobalShutdownHook INFO  CacheManager global JVM shutdown hook triggered (fallback cleanup)
 ```
 
-为什么没有继续逐项二分？因为：
-- 每试一轮 40 秒，四个参数两两组合要十几次
-- 这些值本就是厂商按 746MB 的 `WEB-INF/lib` 算出来的，我并没有比它更懂的依据
-- 真正的目标只是"钉住堆上限"，其余照抄成本最低、风险最小
+**退出码 1、没有异常栈、`FineLog/` 里只有 gc/safepoint** —— 这三条当初让我认定
+"进程自己 `exit(1)`，只能改配置二分"。实际是异常打在了**另一个文件**里：
+`FineLog/` 只放 JVM 级日志（gc、safepoint、hs_err），业务日志在 `logs/` 根下。
 
-**这里有一条值得记住的判据**：容器退出时，
-`OOMKilled=false` + `ExitCode=1` + 日志无异常栈 + 应用自己的日志目录（`FineLog/`）里只有
-gc/safepoint 没有业务日志 —— 说明进程是自己 `exit(1)` 的，不是被杀的、也不是 JVM 崩的。
-这类问题查系统日志没用，只能靠**改配置二分**。
+**为什么会误判成参数问题**：这个异常抛在异步线程（`Thread-21`，经
+`CompletableFuture.register` 的 `AsyncRun`），**触发时机和主线程启动速度赛跑**。
+厂商原串那次恰好主线程先跑完，异常被吞掉，于是就"好"了。后来同一串厂商参数
+连续失败三次 —— **是竞态，不是参数**。
 
-### 2.5 内存测算
+**教训**：
+
+| 曾经的判据 | 靠不住在哪 |
+| --- | --- |
+| `docker logs` 断在哪就是死在哪 | `System.out` 被应用重定向后，日志换文件了 |
+| `FineLog/` 没有业务日志 | 那里只有 JVM 级日志，业务日志在 `logs/` 根 |
+| `ExitCode=1` + 无异常栈 | 栈可能在另一个文件里 |
+| "改了 X 就好了" | 有竞态时，一次成功不构成证据 |
+
+**可靠的排查顺序**：`docker cp` 整个 `/usr/local/tomcat/logs` 出来，按修改时间找最新的
+`*.log`，grep `ERROR|Exception`。`docker logs` 只覆盖 stdout 那一段，仅够看启动进度。
+
+### 2.5 部署向导报「JVM参数配置存在问题」
+
+容器起来、页面能开之后，`/webroot/decision/v10/deployment/recommendation` 会红字报：
+
+> **检测到1项配置异常** — JVM参数配置存在问题
+> 检测到 xmx + directMemory + metaspace + codecache > 容器/服务器分配的内存
+> 请检查内存JVM参数设置是否合理，并确认系统剩余可用内存是否充足。
+
+判据就是这四项之和 ≤ 容器可见内存（读的是 cgroup 限额，不是 `/proc/meminfo`）：
+
+```
+Xmx                   2560 MB
+MaxDirectMemorySize   2048 MB
+MaxMetaspaceSize      2048 MB   ← 厂商值，实测只用到 132 MB
+ReservedCodeCacheSize 1024 MB   ← 厂商值，实测只用到 18 MB
+─────────────────────────────
+合计                  7680 MB   >  容器 5632 MB   → 报错
+```
+
+**第一次想的是"那就压小一点"**，压到 5376 时容器反而起不来（原因见 2.4，
+是 polars 缺类的竞态，不是参数值本身）。2.3 补了 jar 之后理论上可以压了。
+
+**但没有压，改的是容器限额。理由**：
+
+- `MaxMetaspaceSize` / `ReservedCodeCacheSize` / `MaxDirectMemorySize` 都是**上限不是预占**，
+  实测 Metaspace 只用 132 MB、CodeCache 只用 18 MB，压小它们省不出实际内存
+- 压小会在数据量上来时撞 Metaspace OOM，那比"限额数字难看"严重得多
+- 这几个值是厂商按 746 MB 的 `WEB-INF/lib` 算的，没有比它更懂的依据
+
+```
+7680 (四项和)  +  128 (Tomcat native / 线程栈 / mmap)  =  7808 MB
+```
+
+改 `mem_limit` 重启，红字消失。
+
+**副作用要正视**：`bi` 模式的限额合计变成 `1536 + 1792 + 7808 = 11136 MB`，
+比 VM 实见的 9947 MB 还高。这是**纸面超卖**，不是算错：
+`mem_limit` 是 per-container 的保险丝而不是预占，实测三容器合计只用 3.7 GB，
+VM 内 `MemAvailable` 还剩 5.6 GB。真实天花板由 `.wslconfig` 的 10 GB 兜底，
+不由各容器 `mem_limit` 之和决定。
+
+> 这个检查只看**四项配置的和**，不是看实际占用。所以"我明明只用 1.6GB"不构成申诉理由——
+> 它防的是极端负载下 JVM 把承诺的上限全用光然后被 cgroup 打死。
+
+### 2.6 内存测算
 
 | 项 | 数值 | 来源 |
 | --- | --- | --- |
 | 物理内存 | 15.69 GB | `Win32_OperatingSystem` |
 | WSL2 配额 | 10 GB | `.wslconfig` |
-| Docker VM 实见 | **9947 MB** | `docker info .MemTotal` |
+| Docker VM 实见 | **9947 MB** | `docker info` / `grep MemTotal /proc/meminfo` |
 | 实时模式 6 容器限额 | **8960 MB** | `docker inspect .HostConfig.Memory` 求和 |
 | 实时模式余量 | 987 MB | 9947 − 8960 |
-| FineBI 空载实测 | **1540 MB** | `docker stats` |
-| FineBI 容器限额 | **5632 MB** | compose `mem_limit` |
+| FineBI 空载实测 | **1631 MB** | `docker stats`（含引擎 jar 后） |
+| FineBI 容器限额 | **7808 MB** | compose `mem_limit`，由 JVM 自检下限 7680 反推 |
 
-**如果两套同时开**：8960 + 5632 = 14592MB > 9947MB，超 4645MB。不可能。
-即使 FineBI 只给 2GB，8960 + 2048 = 11008 也超了。**共存这条路是堵死的。**
+**如果两套同时开**：8960 + 7808 = 16768MB > 9947MB，超 6821MB。**共存这条路是堵死的。**
 
-**为什么按 8960MB 配 FineBI**：实时模式（6 容器）刚好是 8960MB，
-BI 模式（fe + be + finebi）配成同一个数，两种模式的峰值一致，
-切换前后内存水位不跳变，也就不用动 `.wslconfig`。不是巧合。
+**为什么 `bi` 是 7808 而不是和 `realtime` 一样的 8960**：8960 是 realtime 的自然结果
+（6 个容器厂商推荐值相加），而 7808 是 FineBI 的**下限**——低于它 JVM 自检直接报红。
+两个数接近但来路完全不同，别当成"同一档"。
 
-### 2.6 最终方案：二选一，而不是共存
+### 2.7 最终方案：二选一，而不是共存
 
 ```
 实时模式（realtime）           BI 分析模式（bi）
 ─────────────────             ─────────────────
 mysql        768              doris-fe      1536
 kafka        768              doris-be      1792
-doris-fe    1536              finebi        5632
+doris-fe    1536              finebi        7808
 doris-be    1792              ────────────────────
-flink-jm     768                       合计 8960
-flink-tm    3328
+flink-jm     768                       合计 11136
+flink-tm    3328                          （超卖，见 2.5）
 ─────────────────
         合计 8960
 ```
@@ -292,18 +393,18 @@ bash scripts/switch-mode.sh realtime        # 起 6 容器，停 FineBI
 bash scripts/switch-mode.sh realtime --submit   # 顺带把 4 个作业提起来
 ```
 
-### 2.7 实测结果
+### 2.8 实测结果
 
 BI 模式下三个容器的真实占用：
 
 | 容器 | 实测 | 限额 | 使用率 |
 | --- | --- | --- | --- |
-| rt-doris-fe | 571 MiB | 1536 MiB | 37% |
-| rt-doris-be | 1368 MiB | 1792 MiB | 78% |
-| rt-finebi | 1519 MiB | 5632 MiB | 28% |
-| **合计** | **3458 MiB** | 8960 MiB | — |
+| rt-doris-fe | 657 MiB | 1536 MiB | 43% |
+| rt-doris-be | 1514 MiB | 1792 MiB | 85% |
+| rt-finebi | 1631 MiB | 7808 MiB | 21% |
+| **合计** | **3802 MiB** | 11136 MiB | — |
 
-VM 内 `MemAvailable` 还有 **6.16 GiB**。也就是说限额是"保险丝"，日常远没到。
+VM 内 `MemAvailable` 还有 **5.6 GiB**。限额离实际用量的距离，就是"纸面超卖"仍然安全的余量。
 
 连通性验证：
 
@@ -314,7 +415,7 @@ $ docker exec rt-finebi bash -c 'exec 3<>/dev/tcp/doris-fe/9030'
 9030 可达
 ```
 
-### 2.8 FineBI 接 Doris
+### 2.9 FineBI 接 Doris
 
 Doris FE 的 9030 是 MySQL 协议，FineBI 直接当 MySQL 数据源接，**不用额外起 MySQL**：
 
@@ -365,8 +466,10 @@ docker stats --no-stream rt-finebi rt-doris-fe rt-doris-be
 # 看 JVM 实际生效的堆参数（别信 compose，信 ps）
 docker exec rt-finebi ps -ef | grep -o '\-Xmx[0-9a-zA-Z]*'
 
-# 看 FineBI 自己的日志
-docker exec rt-finebi ls /usr/local/tomcat/logs/FineLog/
+# 看 FineBI 业务日志 —— 注意不是 FineLog/（那里只有 gc/safepoint/hs_err）
+docker exec rt-finebi sh -c 'ls -lt /usr/local/tomcat/logs/*.log | head -3'
+docker exec rt-finebi sh -c 'grep -E "ERROR|Exception" /usr/local/tomcat/logs/fanruan.log | tail -20'
+# stdout 被重定向过就看这个提示：BIDiskFull: proxied System.out and System.err
 
 # 健康状态
 curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' \
@@ -377,8 +480,10 @@ curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' \
 
 | 现象 | 原因 | 怎么确认 |
 | --- | --- | --- |
-| 容器 20 秒后退出，**退出码 1**，日志无异常栈 | 应用自己 exit。JVM 参数被改坏了，或必要组件缺失 | `docker inspect -f '{{.State.OOMKilled}} {{.State.ExitCode}}'` 看是不是 false/1 |
-| 退出码 **137** | 超 `mem_limit`，被内核 SIGKILL | 同上，`OOMKilled=true` 就是它 |
+| 容器 20 秒后退出，**退出码 1**，`docker logs` 断在 `cluster update activator start` | `bi-web` 缺 polars 引擎 jar，加载不到 `com.fanruan.polars.bi.BIWorkerModule` | `docker cp rt-finebi:/usr/local/tomcat/logs .`，grep `fanruan.log` 里的 `Exception` |
+| 同上，但 `FineLog/` 里只有 gc/safepoint | 正常。JVM 级日志在 `FineLog/`，**业务日志在 `logs/` 根** | 别在 `FineLog/` 里找业务栈 |
+| 部署向导红字「JVM参数配置存在问题」 | `Xmx + Direct + Metaspace + CodeCache` > `mem_limit` | 四项相加与限额比；本例 7680 vs 7808 |
+| 退出码 **137** | 超 `mem_limit`，被内核 SIGKILL | `OOMKilled=true` 就是它 |
 | `Found orphan containers (rt-finebi)` | 两份 compose 项目名相同 | compose 顶层加 `name:` |
 | `network rt-net not found` | 主栈没起过，external 网络不存在 | 先起一次 Doris |
 | 卷报 `created for project "docker" (expected "rt-bi")` | 改了项目名，卷 label 没变 | 有数据改 `external: true`，无数据删卷重建 |
@@ -388,12 +493,18 @@ curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' \
 
 ### 3.4 想再省内存可以试的方向
 
-按性价比排，都没实测过，写在这里备查：
+先明确一点：**降 JVM 参数不是为了"省实际内存"**——它们是上限不是预占，压小不省用量。
+真正的收益是**把自检的四项和降下来，从而把 `mem_limit` 也降下来**。
 
-1. **Xmx 再降到 1536m** —— 11 万行数据量足够。风险是复杂仪表板多组件并发时 GC 频繁
-2. **停掉 engine 相关的 `/opt/polars` 检查** —— 无所谓，它只有 8K
+按性价比排，除第 1 条外都没实测过，写在这里备查：
+
+1. **Xmx 降到 1536m** —— 11 万行足够（实测 Old Gen 只用到 146MB）。四项和变 6656，
+   `mem_limit` 可降到 6784。代价是复杂仪表板并发时 GC 变频繁
+2. **Metaspace 降到 1024m** —— 实测只用 132MB，表面上还有七倍余量。但**没实测**，
+   改了要重跑"起容器 + 看自检红字"两步。注意早期那次 1024 失败过，
+   但那是 polars 缺类的竞态（见 2.4），**不能当作"1024 不行"的证据**
 3. **FineBI 用外接 MySQL 配置库** —— 能省 HSQLDB 的内存，但要多起一个 MySQL，**不划算**
-4. **把 `max_connections` / Tomcat 线程数调小** —— `TOMCAT_MAX_THREADS` 默认 500，改 100 能省线程栈
+4. **Tomcat 线程数调小** —— `TOMCAT_MAX_THREADS` 默认 500，改 100 能省线程栈
 5. **不推荐**：把 `.wslconfig` 提到 12GB 让两套共存 —— Windows 只剩 3.6GB，
    内存压缩会先拖慢整机，体验比"切换"差得多
 

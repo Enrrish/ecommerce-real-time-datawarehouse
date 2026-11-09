@@ -466,12 +466,16 @@ bash scripts/switch-mode.sh realtime --submit  # 顺带把 4 个作业提起来
 Docker VM 实见 9947MB，实时模式 6 个容器限额已经是 8960MB，只剩 987MB 余量。
 FineBI 单容器空载就要 1540MB。两套同时开必然超。
 
-于是把 FineBI 也配成 8960MB 一档，两种模式峰值一致：
+FineBI 那一档只能给 7808MB —— 这不是选出来的，是它的 JVM 自检顶出来的**下限**
+（四项和 7680MB 一项都压不得，压了就 25 秒静默退出，见 `docs/note/27`）：
 
 | 模式 | 组成 | 限额 |
 | --- | --- | --- |
 | realtime | mysql + kafka + fe + be + jm + tm | 8960MB |
-| bi | fe + be + finebi | 8960MB |
+| bi | fe + be + finebi | 11136MB |
+
+`bi` 的 11136MB 比 VM 实见的 9947MB 还高，属于**纸面超卖**：`mem_limit` 是保险丝
+不是预占，实测三容器合计只用 3.7GB，VM 内还剩 5.6GB 可用。
 
 ### BI 模式为什么能砍掉 Flink 和 Kafka
 

@@ -24,12 +24,39 @@
 #   4. 6.1 而不是 7.5：7.x 把指标中心/引擎彻底服务化，官方没有单容器形态；
 #      6.1 保留内置 spider 引擎，能单跑。这是选 6.1 的唯一理由。
 #
+#   5. **但 bi-web 镜像少打了一个 jar**：它只带 fine-bi-engine-polars-client
+#      （客户端），而 LocalMiniProcessStart 要反射加载 com.fanruan.polars.bi.BIWorkerModule
+#      —— 那个类只在 bi-engine-worker 镜像的 fine-bi-engine-polars-6.1.jar 里。
+#      缺了它容器会在 25 秒后 exit 1（日志还看不到，被重定向了）。
+#      **卷重建后要重新补一次**，命令见 docs/note/27 §2.3。
+#      switch-mode.sh 检测到这种退出会给出提示。
+#
 # 内存账（详见 docs/note/27-FineBI-与内存预算.md）：
-#   Docker VM 实见        9715 MB
+#   Docker VM 实见        9948 MB
 #   doris-fe + doris-be   3328 MB   ← BI 模式保留，FineBI 要连它查数
-#   本容器                5632 MB
+#   本容器                7808 MB   ← 见下面「为什么是 7808」
 #   --------------------------------
-#   合计                  8960 MB   余 755 MB 给 page cache 和内核
+#   限额合计             11136 MB   ← 纸面超卖，靠实测余量兜底
+#   实测占用              fe 657 + be 1514 + finebi 1586 = 3757 MB
+#                         VM 内 MemAvailable 仍剩 5669 MB
+#
+# 「为什么是 7808」而不是最初写的 5632：
+#
+#   FineBI 自带启动自检，判据是
+#       Xmx + MaxDirectMemorySize + MaxMetaspaceSize + ReservedCodeCacheSize
+#       ≤ 容器内存
+#   不满足就在部署向导页报红字「检测到1项配置异常：JVM参数配置存在问题」
+#   「检测到 xmx + directMemory + metaspace + codecache > 容器/服务器分配的内存」。
+#
+#   厂商原串里这三项非堆参数是 2048 + 2048 + 1024 = 5120 MB，加 Xmx 2560
+#   正好 7680 MB —— 所以容器限额的**下限就是 7680**，5632 数学上过不了。
+#
+#   而厂商串又压不得：实测压到 5376 MB（Metaspace 1536 / CodeCache 512 /
+#   Direct 1280 / Xmx 2048）容器会在 25 秒时静默 exit 1，日志断在
+#   cluster update activator，真死因是 polars 缺少 BIWorkerModule 类
+#   （bi-web 单镜像的固有缺陷，压参数会触发它，细节见 note/27）。
+#
+#   7808 = 7680 + 128，多出的 128 给 Tomcat native、线程栈和 mmap。
 #
 # =============================================================================
 
@@ -76,10 +103,10 @@ services:
       # 官方"建议 8G ≤ Xmx"是按企业级并发和大表算的，本项目用不到；
       # 但要知道这是**低于官方下限**的选择，不是官方推荐配置，别对外这么说。
       #
-      # 注意 MaxDirectMemorySize=2048M + MaxMetaspaceSize=2048m +
-      # ReservedCodeCacheSize=1024m 是"上限"不是"预占"，实测空载只占 1.55GB。
-      # 但理论上限合计 heap 2560 + 其它 5120 ≈ 7.5G > 容器限额，
-      # 所以真要跑重负载，先看 docs/note/27 里的"超限预案"再动 mem_limit。
+      # 注意这四项是"上限"不是"预占"，实测空载只占 1.59 GB。
+      # 但它们的**和** 2560 + 2048 + 2048 + 1024 = 7680 MB 正是 FineBI
+      # 启动自检的判据，必须 ≤ 容器限额 —— mem_limit 因此定为 7808m。
+      # 任何一项都不要压：压了就起不来（实测，见文件头说明与 note/27）。
       # ---------------------------------------------------------------------
       JAVA_OPTS: >-
         -server
@@ -95,8 +122,10 @@ services:
         -XX:ReservedCodeCacheSize=1024m
 
     # 硬上限。超了 OOMKill，不会拖垮 Doris。
-    # 5632 + doris-fe 1536 + doris-be 1792 = 8960MB，VM 实见 9715MB，余 755MB。
-    mem_limit: 5632m
+    # 7808 的下限来自 FineBI 的 JVM 参数自检（见文件头「为什么是 7808」）。
+    # 1536 + 1792 + 7808 = 11136MB > VM 9948MB，属于**纸面超卖**：
+    # mem_limit 是保险丝不是预占，实测三容器合计只用 3757MB。
+    mem_limit: 7808m
 
     # -------------------------------------------------------------------------
     # 持久化：整个 webroot 挂一个命名卷

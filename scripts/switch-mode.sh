@@ -22,8 +22,10 @@
 #
 #   内存账：
 #     realtime  8960MB（mysql 768 + kafka 768 + fe 1536 + be 1792 + jm 768 + tm 3328）
-#     bi        8960MB（fe 1536 + be 1792 + finebi 5632）
-#     两者都刚好卡在 8960MB，VM 9715MB，余 755MB —— 不是巧合，是照着这个上限配的。
+#     bi       11136MB（fe 1536 + be 1792 + finebi 7808）
+#     bi 的 7808 来自 FineBI 的 JVM 自检下限（四项和 7680 不可压），
+#     所以它比 VM 实见的 9947MB 还高 —— 这是**纸面超卖**，不是笔误：
+#     mem_limit 只是保险丝，实测三容器合计 3.7GB，余量 5.6GB。
 #
 # 不做的事（故意的）：
 #   - 不碰 .wslconfig。提高到 12GB 能让两套共存，但 Windows 只剩 3.6GB，
@@ -227,7 +229,15 @@ mode_bi() {
     for i in $(seq 1 40); do
       st=$(d inspect -f '{{.State.Health.Status}}' rt-finebi 2>/dev/null)
       [[ "$st" == "healthy" ]] && { echo " → healthy"; break; }
-      [[ "$(d inspect -f '{{.State.Status}}' rt-finebi 2>/dev/null)" == "exited" ]] && { echo " → 退出了"; break; }
+      if [[ "$(d inspect -f '{{.State.Status}}' rt-finebi 2>/dev/null)" == "exited" ]]; then
+        echo " → 退出了"
+        # 最常见的原因：卷被重建后，WEB-INF/lib 里又变回 client 版 polars jar，
+        # bi-web 就会在 cluster 初始化时抛 ClassNotFoundException 并 shutdown。
+        if d logs rt-finebi 2>&1 | grep -q 'BIWorkerModule'; then
+          warn "缺 polars 引擎 jar（重建卷后会复发）—— 补法见 docs/note/27 §2.3"
+        fi
+        break
+      fi
       printf '.'; sleep 5
     done
   fi
