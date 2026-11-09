@@ -1,21 +1,21 @@
 # 27 · FineBI 与内存预算
 
 > 这篇记录一次真实的技术选型：拿到一个 13GB 的「FineBI 离线部署包」，要判断这台 16GB 的机器能不能跑，
-> 最后怎么跑。结论分两段：
+> 最后怎么跑。
 >
-> - **引擎集群能跑**：master + worker 两个容器在这台机器上起来了、注册成功、内存还剩一半
-> - **FineBI 本身用不了**：`bi-web` 是 Java 8，而 polars 引擎（包括它的"进程内迷你模式"）
->   全部是 Java 11 编译的类。web 要么没有引擎，要么加载失败直接崩，两条路都进不去系统
+> **最终结论（2026-11-09 定稿）：容器化这条路放弃，改用 Windows 宿主上的 FineBI 6.0 单机版，
+> 直连 Doris 的 `127.0.0.1:9030`。** 三个容器、四个数据卷、`docker-compose.finebi.yml`
+> 已全部删除；当前接法见 [28 · FineBI 单机版接入](28-FineBI单机版接入.md)。
 >
-> 中途踩了四个坑，都在正文里留了完整复盘：
+> 这篇仍然留着，因为它是**否定性结论的证据链**，而且踩过的坑都能复用：
 >
 > 1. `docker logs` 会骗人 —— `BIDiskFull: proxied System.out and System.err` 之后真日志只在 `fanruan.log`
 > 2. `bi-web` 单镜像**缺 357MB 的引擎实现包**，而 `polars-client`（141MB）里只有 RPC 桩
 > 3. 补上 jar 之后撞到更硬的一层：**实现包是 class 55，`bi-web` 是 class 52**，换 JDK 又会崩另外三处
 > 4. worker 的 `Xmx` 低于 2048 时，polars 的内存分账会算出负数直接崩（见 2.11）
 >
-> 第 2、3 条是这篇最贵的一课。最终做法是：**三容器的编排留着（引擎侧真的能跑），
-> web 侧退回内置 spider 并接受部署向导过不去**——要用 FineBI 只能走官网单机版安装包。
+> 注意：2.8 那个"最终方案"指的是**容器阶段的**最终方案，不是项目的最终方案。
+> 这条线的终点在 2.11 末尾 —— 容器能起，web 用不上，于是整条路线被砍。
 >
 > 全文只有两个数字来源：帆软官方文档，和本机实测。凡是估的都会写明是估的。
 
@@ -505,7 +505,7 @@ VM 内 `MemAvailable` 还剩 5.6 GB。真实天花板由 `.wslconfig` 的 10 GB 
 （6 个容器厂商推荐值相加），而 7808 是 FineBI 的**下限**——低于它 JVM 自检直接报红。
 两个数接近但来路完全不同，别当成"同一档"。
 
-### 2.8 最终方案：二选一，而不是共存
+### 2.8 容器阶段的方案：二选一，而不是共存
 
 ```
 实时模式（realtime）           BI 分析模式（bi）
@@ -534,12 +534,16 @@ $ docker exec rt-doris-fe mysql -h127.0.0.1 -P9030 -uroot -D realtime_dw -N -B -
 
 ```bash
 bash scripts/switch-mode.sh status          # 看现在是什么模式 + 内存账
-bash scripts/switch-mode.sh bi              # 停 Flink/Kafka/MySQL，留 Doris，起 FineBI
-bash scripts/switch-mode.sh realtime        # 起 6 容器，停 FineBI
+bash scripts/switch-mode.sh bi              # 停 Flink/Kafka/MySQL，只留 Doris
+bash scripts/switch-mode.sh realtime        # 起 6 容器
 bash scripts/switch-mode.sh realtime --submit   # 顺带把 4 个作业提起来
 ```
 
-### 2.9 实测结果
+> 上面是**改版后**的语义。容器化阶段 `bi` 模式还会顺带起 FineBI 的三个容器，
+> 那一档的限额是 11136MB。三个容器删掉之后 `bi` 只剩 `fe + be = 3328MB`，
+> 实测占用 2342MB / VM 9947MB，余 7.6GB —— 这部分余量就是留给 Windows 上的 FineBI 的。
+
+### 2.9 实测结果（容器阶段，历史数据）
 
 BI 模式下三个容器的真实占用：
 
@@ -587,14 +591,18 @@ $ docker exec rt-finebi bash -c 'exec 3<>/dev/tcp/doris-fe/9030'
 
 Doris FE 的 9030 是 MySQL 协议，FineBI 直接当 MySQL 数据源接，**不用额外起 MySQL**：
 
-| 字段 | 值 |
-| --- | --- |
-| 类型 | MySQL |
-| 主机 | `doris-fe`（**不能写 localhost**，容器内的 localhost 是容器自己） |
-| 端口 | 9030 |
-| 用户名 | root |
-| 密码 | 空 |
-| 数据库 | `realtime_dw` |
+| 字段 | 值（容器版） | 值（Windows 版） |
+| --- | --- | --- |
+| 类型 | MySQL | MySQL |
+| 主机 | `doris-fe`（**不能写 localhost**） | `127.0.0.1`（**不能写 doris-fe**） |
+| 端口 | 9030 | 9030 |
+| 用户名 | root | `bi_ro` |
+| 密码 | 空 | `bi_ro_2026` |
+| 数据库 | `realtime_dw` | `realtime_dw` |
+
+两列正好相反，原因是**谁来做地址解析**：容器内靠 Docker DNS，宿主靠 Docker Desktop
+的端口代理。宿主侧连容器的**内部 IP**（`172.28.0.10`）也不通 —— 只有发布出来的端口可用。
+详细推导和实测见 [28 · FineBI 单机版接入](28-FineBI单机版接入.md) §1.1 / §2.3。
 
 能查的表：`dwd_trade_order_detail`(112,650) / `dws_trade_overview_1m`(88,157) /
 `ads_realtime_overview` / `ads_order_stream` 等。
@@ -700,6 +708,31 @@ web 是 **class 52（Java 8）**。所以：
 集群能起，web 用不上。要用 FineBI 只能走官网的**单机版安装包**（一个 tar.gz 解压即用，
 lib 里是完整的 Java 8 实现），不是这个集群镜像包。
 
+### 2.12 收尾：这条路线被砍掉了
+
+2026-11-09 下午，按上面的结论执行了清理：
+
+```bash
+docker compose -f docker-compose.finebi.yml down -v   # 三个容器 + 三个卷
+docker volume rm rt-java11                            # 早期试 Java 11 的遗留卷
+rm docker/docker-compose.finebi.yml
+```
+
+同时 `scripts/switch-mode.sh` 的 `bi` 模式改成"只留 Doris"，Windows 侧的
+FineBI 6.0 单机版直连 `127.0.0.1:9030`。接法见 [note 28](28-FineBI单机版接入.md)。
+
+保留下来的是知识而不是容器：
+
+- **`docker logs` 什么时候会说谎**（stdout 被重定向 → 真日志在 `fanruan.log`）
+- **一个产品的两个角色可以用两个 JDK**，跨角色拷 jar 必然失败
+- **`mem_limit` 是保险丝不是预占**，两个口径（`docker stats` vs `HostConfig.Memory`）不能混算
+- **polars 把 `Xmx` 当整机内存分账**，所以它有硬下限
+
+这四个坑在别的中间件上会以别的形式再出现一次，这才是这篇的价值。
+
+> 镜像本身（`bi-web` / `bi-engine-master` / `bi-engine-worker` / `fine-canvas61`，合计约 9.3GB）
+> 这次没删，命令留在 3.2。真要腾空间时先确认 `/d/finebi-pkg` 里那份 tgz 还在。
+
 ---
 
 ## 三、速查
@@ -717,20 +750,30 @@ docker load -i /d/finebi-pkg/finekey/resources/images/bi61all-tomcat-amd64-publi
 
 `docker load` 一个 2GB 的 tgz 约 3 分钟。load 完可以删掉解出来的 tgz。
 
-但 `/d/finebi-pkg` 里那个 341MB 的 `fine-bi-engine-polars-6.1.jar` **先别删**：
-它是从 worker 镜像里单独提取的，将来若改走官方三容器方案，直接从这里取，不用再解 13GB 的包。
-（卷里 `WEB-INF/lib.disabled/` 也留了一份。）
+> **`bi61all` 是 4 个镜像的 bundle**，不是"单机全量版"：
+> `bi-web` / `bi-engine-master` / `bi-engine-worker` / `fine-canvas61`。
+> 名字里的 `all` 指角色齐全，不是部署形态。这一点值得单独记一笔 ——
+> 看到 `all` 就以为是"一体化单机包"，是这条弯路最开始的那个误判。
+>
+> 那个 341MB 的 `fine-bi-engine-polars-6.1.jar` 现在不用留了，路线已砍（见 2.12）。
 
 ### 3.2 常用命令
 
-```bash
-# 起停（独立 compose，项目名 rt-bi）
-# 三容器有严格顺序：master 先 healthy，worker 才注册得上去
-bash scripts/switch-mode.sh bi        # 推荐：按 master → worker → web 起，并逐个等就绪
-cd docker && docker compose -f docker-compose.finebi.yml up -d
-cd docker && docker compose -f docker-compose.finebi.yml down     # 卷保留
-cd docker && docker compose -f docker-compose.finebi.yml down -v  # 卷也删（工程配置丢失）
+> 三个容器已经删除（见 2.12）。下面第一段是**清理与复现**用的，不是日常命令。
 
+```bash
+# ---- 清理（已执行，留作记录） ----
+docker compose -f docker-compose.finebi.yml down -v   # 三容器 + 三个卷
+docker volume rm rt-java11
+rm docker/docker-compose.finebi.yml
+
+# 连镜像一起清（约 9.3GB，未执行；先确认 /d/finebi-pkg 里的 tgz 还在）
+docker rmi bi-web:6.1-20261016-6.1.11.1-tomcat-amd64-publish \
+           bi-engine-master:6.1-20261016-6.1.11.1-tomcat-amd64-publish \
+           bi-engine-worker:6.1-20261016-6.1.11.1-tomcat-amd64-publish \
+           fine-canvas61:6.1-20261016-6.1.11.1-tomcat-amd64-publish
+
+# ---- 以下只在容器还在时有效 ----
 # 三容器状态一眼看
 docker ps --filter name=rt-finebi --format '{{.Names}}\t{{.Status}}'
 
@@ -789,11 +832,15 @@ curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' \
 | `network rt-net not found` | 主栈没起过，external 网络不存在 | 先起一次 Doris |
 | 卷报 `created for project "docker" (expected "rt-bi")` | 改了项目名，卷 label 没变 | 有数据改 `external: true`，无数据删卷重建 |
 | **Docker Desktop 说还剩 5GB，脚本说超了 1GB** | 两个口径：前者是实际占用，后者是限额之和 | 见 2.9；看 `docker stats`，不是 `HostConfig.Memory` |
-| FineBI 里连不上 Doris | 数据源写了 `localhost` | 容器内 localhost 是容器自己，必须写 `doris-fe` |
+| FineBI 里连不上 Doris（容器版） | 数据源写了 `localhost` | 容器内 localhost 是容器自己，必须写 `doris-fe` |
+| FineBI 里连不上 Doris（Windows 版） | 反过来：**必须**写 `127.0.0.1`，`doris-fe` 在宿主上解析不了 | 宿主没有 Docker 的 DNS，只认发布端口 |
 | `docker exec` 里路径变成 `D:/…` | Git Bash 把容器路径翻译成 Windows 路径 | 加 `MSYS_NO_PATHCONV=1` |
 | `docker cp` 报 `directory "c:\tmp" does not exist` | 上一条的反面：`MSYS_NO_PATHCONV=1` 又关掉了 POSIX→Windows 翻译 | 目标写 Windows 形式 `"D:/finebi-pkg/x"` |
 
-### 3.4 想再省内存可以试的方向
+### 3.4 想再省内存可以试的方向（仅当恢复容器版）
+
+> 本节的前提是"FineBI 还在容器里"。现在它已经搬到 Windows 宿主，
+> 这一节只在**将来又要容器化**时才有意义，留作备查。
 
 先明确一点：**降 JVM 参数不是为了"省实际内存"**——它们是上限不是预占，压小不省用量。
 真正的收益是**把自检的四项和降下来，从而把 `mem_limit` 也降下来**。

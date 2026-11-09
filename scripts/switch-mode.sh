@@ -4,16 +4,19 @@
 # -----------------------------------------------------------------------------
 # 用法：
 #   bash scripts/switch-mode.sh                 # 看当前是什么模式（同 status）
-#   bash scripts/switch-mode.sh realtime        # 实时模式：6 个容器全起，停 FineBI
-#   bash scripts/switch-mode.sh bi              # BI 模式：只留 Doris + FineBI
+#   bash scripts/switch-mode.sh realtime        # 实时模式：6 个容器全起
+#   bash scripts/switch-mode.sh bi              # BI 模式：只留 Doris（fe + be）
 #   bash scripts/switch-mode.sh bi --submit     # BI 模式，但把 4 个 Flink 作业也提起来
 #   bash scripts/switch-mode.sh status
 #
-# 为什么要有这个脚本（方案 D 的由来）：
-#   这台机器物理内存 15.69GB，WSL 配额 10GB，Docker VM 实见 9715MB。
-#   实时模式 6 个容器限额合计 8960MB，已经只剩 755MB 余量；
-#   FineBI 单容器空载就要 1540MB。两套同时开必爆。
-#   所以不做"共存"，做"切换"：任一时刻只让一套吃内存。
+# 为什么要有这个脚本：
+#   这台机器物理内存 15.69GB，WSL 配额 10GB，Docker VM 实见 9948MB。
+#   实时模式 6 个容器限额合计 8960MB，只剩约 1GB 余量。
+#   再往容器里塞一个 BI 工具必然爆 —— 所以 BI 不容器化。
+#
+#   BI 侧用的是**宿主 Windows 上的 FineBI 6.0 单机版**，直连 Doris 的
+#   9030（MySQL 协议）。它跑在 Windows 里，不进 WSL2 的 10GB 配额，
+#   等于把整块内存还给数仓。连接方式见 docs/note/28。
 #
 #   BI 模式为什么可以砍掉 Flink 和 Kafka：
 #     数据已经落在 Doris 里了。Flink 停掉只是不再"继续计算"，
@@ -22,31 +25,21 @@
 #
 #   内存账：
 #     realtime  8960MB（mysql 768 + kafka 768 + fe 1536 + be 1792 + jm 768 + tm 3328）
-#     bi       16768MB（fe 1536 + be 1792 + finebi 7808 + master 2048 + worker 3584）
-#     bi 的 7808 来自 FineBI 的 JVM 自检下限（四项和 7680 不可压）；
-#     worker 的 3584 来自 polars 的分账模型（Xmx < 1256 会算出负数直接崩，
-#     详见 docker-compose.finebi.yml 文件头「六」），这两项都压不下去。
-#     所以限额合计比 VM 实见的 9947MB 高 —— 这是**纸面超卖**，不是笔误：
-#     mem_limit 只是保险丝，实测五容器合计约 4.8GB，余量 5GB。
+#     bi        3328MB（fe 1536 + be 1792）
 #
 # 不做的事（故意的）：
 #   - 不碰 .wslconfig。提高到 12GB 能让两套共存，但 Windows 只剩 3.6GB，
-#     浏览器的内存压缩会先把整机拖慢，得不偿失。
+#     而 FineBI 就装在 Windows 上，抢了它的内存反而更慢。
 #   - 不删数据卷。切模式只是 stop，任何分支都不带 -v。
-#   - 不改 finekey 那套 23 镜像的编排。FineOps 企业版最低 64GB，跑不动。
+#   - 不再维护容器版 FineBI。finekey 那套是集群编排包（21 个镜像包 + 编排器），
+#     官方最低 64GB，且 bi-web(Java 8) 装不下 polars 引擎(Java 11)。
+#     复盘见 docs/note/27。
 # =============================================================================
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 cd "$ROOT" || exit 1
-
-MAIN_COMPOSE="$ROOT/docker/docker-compose.yml"
-BI_COMPOSE="$ROOT/docker/docker-compose.finebi.yml"
-
-# FineBI 侧三个容器。顺序有意义：停的时候从左往右（worker 先死，master 后死），
-# 起的时候从右往左（master 先活，worker 才能注册）。
-BI_CONTAINERS="rt-finebi-worker rt-finebi-master rt-finebi"
 
 MODE=status
 SUBMIT=0
@@ -57,7 +50,7 @@ while [[ $# -gt 0 ]]; do
     bi)          MODE=bi; shift ;;
     status)      MODE=status; shift ;;
     --submit)    SUBMIT=1; shift ;;
-    -h|--help)   sed -n '2,36p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   awk 'NR>2 && /^# =====/ {exit} NR>2 {sub(/^# ?/,""); print}' "$SELF"; exit 0 ;;
     *) echo "未知参数：$1（--help 看用法）" >&2; exit 2 ;;
   esac
 done
@@ -70,6 +63,8 @@ die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
 
 d() { MSYS_NO_PATHCONV=1 docker "$@"; }
+
+ALL_CONTAINERS="rt-mysql rt-kafka rt-flink-jm rt-flink-tm rt-doris-fe rt-doris-be"
 
 # --- 内存账 -----------------------------------------------------------------
 # MemTotal 从 docker info 拿，是 VM 里 /proc/meminfo 的值，比 .wslconfig
@@ -113,11 +108,11 @@ mem_report() {  # $1=mode
   if [[ -z "$vm" ]]; then warn "拿不到 Docker VM 内存（引擎没跑？）"; return 0; fi
 
   if [[ "$1" == "bi" ]]; then
-    used=$(sum_used rt-doris-fe rt-doris-be $BI_CONTAINERS)
-    limit=$(sum_limits rt-doris-fe rt-doris-be $BI_CONTAINERS)
+    used=$(sum_used rt-doris-fe rt-doris-be)
+    limit=$(sum_limits rt-doris-fe rt-doris-be)
   else
-    used=$(sum_used rt-mysql rt-kafka rt-doris-fe rt-doris-be rt-flink-jm rt-flink-tm)
-    limit=$(sum_limits rt-mysql rt-kafka rt-doris-fe rt-doris-be rt-flink-jm rt-flink-tm)
+    used=$(sum_used $ALL_CONTAINERS)
+    limit=$(sum_limits $ALL_CONTAINERS)
   fi
 
   # 两个口径必须分开说：一个是"现在吃了多少"，一个是"最多能吃多少"。
@@ -140,40 +135,36 @@ show_status() {
   local rt=0 bi=0 c st
 
   step "容器"
-  for c in rt-mysql rt-kafka rt-flink-jm rt-flink-tm rt-doris-fe rt-doris-be \
-           rt-finebi-master rt-finebi-worker rt-finebi; do
+  for c in $ALL_CONTAINERS; do
     st=$(d inspect -f '{{.State.Status}}{{if .State.Health}} / {{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)
     if [[ -z "$st" ]]; then
       printf '    %-14s %s\n' "$c" "(不存在)"
       continue
     fi
     printf '    %-14s %s\n' "$c" "$st"
-    [[ "$st" == running* ]] || continue
-    case "$c" in
-      rt-finebi*) bi=$((bi + 1)) ;;
-      *)          rt=$((rt + 1)) ;;
-    esac
+    [[ "$st" == running* ]] && rt=$((rt + 1))
   done
 
   step "模式"
-  if [[ "$bi" -gt 0 && "$rt" -gt 2 ]]; then
-    warn "两套同时开着（${rt} 个数仓容器 + FineBI）—— 内存会超，考虑切一下"
-  elif [[ "$bi" -gt 0 ]]; then
-    ok "BI 分析模式（FineBI + ${rt} 个数仓容器）"
-  elif [[ "$rt" -eq 6 ]]; then
-    ok "实时数仓模式（6 个容器，FineBI 停着）"
+  if [[ "$rt" -eq 6 ]]; then
+    ok "实时数仓模式（6 个容器全开）"
+  elif [[ "$rt" -eq 2 ]] && \
+       [[ "$(d inspect -f '{{.State.Running}}' rt-doris-fe 2>/dev/null)" == "true" ]] && \
+       [[ "$(d inspect -f '{{.State.Running}}' rt-doris-be 2>/dev/null)" == "true" ]]; then
+    ok "BI 分析模式（只留 Doris，FineBI 在 Windows 宿主上跑）"
   elif [[ "$rt" -gt 0 ]]; then
-    info "非标准状态：${rt} 个数仓容器在跑，FineBI 没起"
+    info "非标准状态：${rt} 个容器在跑"
   else
     info "全部停止"
   fi
 
   step "内存"
   docker_up_check
-  mem_report "$([[ "$bi" -gt 0 ]] && echo bi || echo realtime)"
+  mem_report "$([[ "$rt" -eq 2 ]] && echo bi || echo realtime)"
 
   step "入口"
-  info "FineBI  ：http://localhost:${FINEBI_PORT:-9080}/webroot/decision"
+  info "FineBI 6.0（Windows 单机版）：http://localhost:37799"
+  info "  数据源 127.0.0.1:9030  root / 空密码  realtime_dw"
   info "大屏    ：http://localhost:8080（需 bash dashboard/run.sh）"
   info "Flink UI：http://localhost:8081"
 }
@@ -197,30 +188,10 @@ wait_healthy() {
   return 1
 }
 
-# --- 停 FineBI --------------------------------------------------------------
-stop_finebi() {
-  local c any=0
-  # 顺序 = BI_CONTAINERS 的顺序：worker → master → web。
-  # 先停 worker 是因为它的 monitor 会盯着 master，反过来停会让它刷一串
-  # "master 失联"再自己 exit 66，日志脏。
-  for c in $BI_CONTAINERS; do
-    if [[ "$(d inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" == "true" ]]; then
-      # FineBI 的 HSQLDB 配置库要写 checkpoint，给 60s（compose 里也写了
-      # stop_grace_period: 60s，但那只在重建后生效，这里显式传 -t 更稳）
-      d stop -t 60 "$c" >/dev/null 2>&1
-      ok "$c 已停（退出码 $(d inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)）"
-      any=1
-    fi
-  done
-  [[ "$any" -eq 0 ]] && info "三个 FineBI 容器本来都没在跑"
-  return 0
-}
-
 # --- 实时模式 ---------------------------------------------------------------
 mode_realtime() {
   docker_up_check
   step "切到实时数仓模式"
-  stop_finebi
 
   step "起 6 个容器"
   ( cd "$ROOT/docker" && d compose --profile source --profile compute --profile olap up -d ) \
@@ -262,7 +233,6 @@ submit_jobs() {
 mode_bi() {
   docker_up_check
   step "切到 BI 分析模式"
-  stop_finebi
 
   step "停 Flink / Kafka / MySQL"
   local c
@@ -279,64 +249,29 @@ mode_bi() {
   ( cd "$ROOT/docker" && d compose --profile olap up -d doris-fe doris-be ) \
     | grep -E 'Started|Created|Running|Error' | sed 's/^/  /'
 
-  step "起 FineBI（顺序：master → worker → web）"
-
-  # 顺序不能乱，也不能靠 compose 的 depends_on 一把起：
-  #   · worker 一启动就去连 master:8000。连不上时它的 monitor 直接 exit 66
-  #     （不重试、不等待），所以 master 必须**先 healthy**。
-  #   · web 反过来最不怕等，放最后只是为了日志好看。
-  if [[ "$(d inspect -f '{{.State.Health.Status}}' rt-finebi-master 2>/dev/null)" == "healthy" ]]; then
-    info "rt-finebi-master 已 healthy"
-  else
-    ( cd "$ROOT/docker" && d compose -f docker-compose.finebi.yml up -d finebi-master ) \
-      | grep -E 'Started|Created|Error' | sed 's/^/  /'
-    printf '    master 加载 357MB 引擎包'
-    wait_healthy rt-finebi-master 120 || warn "master 没起来，看：docker logs rt-finebi-master"
-  fi
-
-  ( cd "$ROOT/docker" && d compose -f docker-compose.finebi.yml up -d finebi-worker finebi ) \
-    | grep -E 'Started|Created|Error' | sed 's/^/  /'
-
-  printf '    worker'
-  if ! wait_healthy rt-finebi-worker 180; then
-    warn "worker 没起来"
-    info "常见原因：Xmx 小于 2048 会撞 polars 的分账检查，日志里搜 'memory size for polars too small'"
-    info "另一种：master 在上一步没真正 ready，worker 的 monitor 会 exit 66"
-  fi
-
-  printf '    web'
-  if ! wait_healthy rt-finebi 150; then
-    warn "web 没起来"
-    # 卷被重建后，WEB-INF/lib 里会变回原厂的 client 版 polars jar，
-    # bi-web 就会在 Loading polars 时抛 ClassNotFoundException 并 shutdown。
-    # 本项目的解法是**把 polars jar 移除**（Java 8 装不下 Java 11 的引擎），
-    # 不是补 jar —— 补了会变成 UnsupportedClassVersionError。
-    if d logs rt-finebi 2>&1 | grep -q 'BIWorkerModule'; then
-      warn "卷里又有 polars jar 了（重建卷后必复发）"
-      info "移除命令见 docs/note/27 §3.2；移除后 25 秒 healthy"
-    fi
-  fi
+  printf '    doris-fe'
+  wait_healthy rt-doris-fe 120 || warn "FE 没起来，看：docker logs rt-doris-fe"
+  printf '    doris-be'
+  wait_healthy rt-doris-be 180 || warn "BE 没起来，看：docker logs rt-doris-be"
 
   mem_report bi
 
   hr
-  echo "引擎拓扑"
-  info "web    172.28.0.30:8080（宿主 9080）"
-  info "master 172.28.0.31:8000  元数据与调度"
-  info "worker 172.28.0.32:9001  计算（monitor 在 9000）"
-  info "worker 是否注册成功：docker logs rt-finebi-master | grep 'Sync Worker'"
+  echo "BI 模式下的连接参数（FineBI 在 Windows 宿主上，走发布端口）"
+  info "主机 127.0.0.1   端口 9030   用户 root   密码 空"
+  info "库   realtime_dw   驱动 MySQL 8（useSSL=false）"
   echo
-  echo "BI 模式下能查的数据（Doris 里是上次跑完的静态快照）"
-  info "库 realtime_dw，FE 9030（MySQL 协议）"
-  info "DWD dwd_trade_order_detail  112,650 行"
-  info "DWS dws_trade_overview_1m    88,157 行"
-  info "ADS 7 张表（ads_realtime_overview / ads_order_stream / …）"
+  echo "直连的 7 张 ADS 表"
+  info "ads_realtime_overview    88,157 行  分钟级 GMV/订单概览"
+  info "ads_order_stream         98,666 行  订单明细流"
+  info "ads_category_rank_1d     18,990 行  品类排行"
+  info "ads_region_map_1d        10,701 行  州维度地图"
+  info "ads_payment_method_1d     2,276 行  支付方式"
+  info "ads_funnel_1d                16 行  转化漏斗"
+  info "ads_pipeline_health       5,203 行  链路健康度"
   echo
-  echo "FineBI 接数据源"
-  info "新建「MySQL」连接：主机 doris-fe  端口 9030  用户 root  无密码"
-  info "注意别用 localhost —— 容器内的 localhost 是容器自己"
-  echo
-  info "打开 http://localhost:${FINEBI_PORT:-9080}/webroot/decision"
+  info "口径红线：cum_gmv 不可 SUM；buyer_cnt 跨维度不可加"
+  info "打开 http://localhost:37799"
 }
 
 # --- 主流程 -----------------------------------------------------------------

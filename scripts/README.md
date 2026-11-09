@@ -16,7 +16,7 @@ scripts/
 ├── calibrate_late_ratio.py  # 给 late_ratio 做正向对照（注入已知比例的迟到事件）
 ├── check_lag.py          # 端到端延迟真采样 → P50/P95/P99
 ├── stop.sh               # 安全关停：停大屏 → 按依赖倒序停容器 → 打印怎么再开
-└── switch-mode.sh        # 实时数仓模式 / BI 分析模式二选一（内存只够跑一套）
+└── switch-mode.sh        # 实时数仓模式 / BI 分析模式二选一（BI 侧只留 Doris）
 ```
 
 ## 依赖
@@ -456,34 +456,33 @@ flink-tm → flink-jm → doris-be → doris-fe → kafka → mysql
 
 ```bash
 bash scripts/switch-mode.sh                  # 看当前模式 + 内存账（同 status）
-bash scripts/switch-mode.sh bi               # BI 模式：只留 Doris，起 FineBI 三容器
-bash scripts/switch-mode.sh realtime         # 实时模式：起 6 容器，停 FineBI
+bash scripts/switch-mode.sh bi               # BI 模式：只留 Doris（fe + be）
+bash scripts/switch-mode.sh realtime         # 实时模式：起 6 容器
 bash scripts/switch-mode.sh realtime --submit  # 顺带把 4 个作业提起来
 ```
 
-BI 模式的三个容器按 `master → worker → web` 起，脚本会逐个等 healthy：
-worker 一启动就注册到 `master:8000`，连不上它的 monitor 会直接 `exit 66`（不重试），
-所以顺序不能靠 compose 的 `depends_on` 图省事。
+`bi` 模式现在只做两件事：停掉 Flink / Kafka / MySQL，确保 Doris 的 fe 和 be 在跑。
+BI 工具本身**不在这台 Docker 里** —— FineBI 6.0 单机版装在 Windows 宿主上，
+直连 `127.0.0.1:9030`。它不进 WSL2 的 10GB 配额，所以不再需要"二选一"，
+切模式纯粹是为了把 Flink 的 4GB 让给 Doris 做快照查询。
 
-### 为什么是"切换"而不是"共存"
+### 为什么 BI 不容器化
 
-Docker VM 实见 9947MB，实时模式 6 个容器限额已经是 8960MB，只剩 987MB 余量。
-BI 模式那三个容器空载就要 3.2GB。两套同时开必然超。
+试过，走不通。`bi-web` 是 Java 8（class 52），finekey 包里的 polars 引擎是
+Java 11（class 55），`LocalMiniProcessStart` 要在 web 自己的 JVM 里加载那批类，
+必然 `ClassNotFoundException`。三个容器（web 7808MB + master 2048MB +
+worker 3584MB）也吃掉了 VM 的三分之二。
 
-两档限额里有两项是**顶出来的下限**，不是选的：
-
-- FineBI web 的 **7808MB**：JVM 自检要求 Xmx + Direct + Metaspace + CodeCache ≤ 容器限额，
-  厂商原串四项和 7680
-- FineBI worker 的 **3584MB**：polars 把 Xmx 当"整机内存"来分账，
-  Xmx < 1256 会算出负数直接崩（`memory size for polars too small : -xxx`）
+换成 Windows 单机版之后，容器侧只剩 Doris：
 
 | 模式 | 组成 | 限额 |
 | --- | --- | --- |
 | realtime | mysql + kafka + fe + be + jm + tm | 8960MB |
-| bi | fe + be + finebi-master + finebi-worker + finebi | 16768MB |
+| bi | fe + be | 3328MB |
 
-`bi` 的 16768MB 比 VM 实见的 9947MB 高得多，属于**纸面超卖**：`mem_limit` 是保险丝
-不是预占，实测五容器合计只用 4.8GB，VM 内还剩 5GB 可用。
+实测 `bi` 模式占用 2.3GB / VM 9947MB，余 7.6GB —— 余量足够给 Windows 上的
+FineBI 用，两边不再互斥。复盘见 [`docs/note/27`](../docs/note/27-FineBI-与内存预算.md)，
+接法见 [`docs/note/28`](../docs/note/28-FineBI单机版接入.md)。
 
 ### BI 模式为什么能砍掉 Flink 和 Kafka
 
