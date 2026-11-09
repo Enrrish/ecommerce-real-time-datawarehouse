@@ -165,6 +165,8 @@ ads_pipeline_health     metric_key, metric_name, metric_value, metric_unit, metr
 
 1. 打开 `http://localhost:37799`（FineBI 6.0 的默认端口），用管理员登录
 2. **管理系统 → 数据连接 → 新建数据连接 → MySQL**
+   （认准「数据连接」四个字。旁边的「外接数据库」是迁 FineBI 自己的配置库，
+   填到那里必报 `could not execute statement`，见 2.6 ⑥）
 3. 填 2.3 那张表。驱动选内置的 `com.mysql.cj.jdbc.Driver`
 4. 点「测试连接」，成功后保存
 5. 新建分析主题 → 选这个连接 → 勾 7 张 `ads_*` 表
@@ -205,6 +207,36 @@ Doris 的 `information_schema` 是实时拼的，表多时会有几百毫秒。
 **⑤ 别用 `localhost` 之外的写法。** 宿主上 `doris-fe` 这个名字解析不了，
 `172.28.0.10` 也不通 —— Docker Desktop 只代理**发布出来的端口**，
 容器内部 IP 在宿主侧是不可路由的。
+
+**⑥ 最容易走错的一步：「外接数据库配置」不是「数据连接」。** 这两个页面长得都像
+"填 MySQL 参数"，但干的事完全不同：
+
+| | 外接数据库配置 | 数据连接 |
+| --- | --- | --- |
+| 入口 | 管理系统 → 系统管理 → 外接数据库 | 管理系统 → **数据连接** → 新建数据连接 |
+| 作用 | 把 **FineBI 自己的配置库**（finedb）从内置 HSQLDB 迁到外部 MySQL | 加一个**只读的数据源** |
+| 特征按钮 | 「**启用新数据库**」 | 「**测试连接**」 |
+| 对 Doris | **一定失败** | 正常 |
+
+走错页面会得到一句毫无信息量的 `could not execute statement` —— 那是 Hibernate
+执行建表 DDL 失败的通用包装。用 Doris 实测，FineBI 建平台库会发的 DDL 里有三处它读不懂：
+
+```sql
+-- 1. 表级 PRIMARY KEY 约束：Doris 要的是 UNIQUE KEY(id) / DUPLICATE KEY(...)
+PRIMARY KEY (id)                                   -- Syntax error ... ^
+-- 2. 更新时间戳：Doris 没有这个列属性
+gmt_modified DATETIME DEFAULT CURRENT_TIMESTAMP
+             ON UPDATE CURRENT_TIMESTAMP           -- Syntax error ... Encountered: ON
+-- 3. 外键：Doris 不支持
+ALTER TABLE t ADD CONSTRAINT fk1 FOREIGN KEY ...    -- Syntax error ... ^
+```
+
+顺带一条：Doris 的库名不能以 `_` 开头（`Incorrect database name '_xxx'`），
+建临时库做验证时容易撞上。
+
+**结论：平台配置库留在内置 HSQLDB 就好**（单机单人没有并发的必要）。
+真嫌它不放心，目标是 MySQL，不是 Doris —— Doris 是列存 OLAP，
+没有事务、没有外键、没有行级更新，本来就不是存元数据的库。
 
 ---
 
@@ -254,6 +286,8 @@ docker exec rt-doris-fe mysql -uroot -P9030 -h127.0.0.1 -N -B -e \
 
 | 现象 | 原因 | 怎么办 |
 | --- | --- | --- |
+| `could not execute statement` | 走错页了：在「外接数据库配置」里填 Doris | 换到「数据连接」，见 2.6 ⑥ |
+| `Incorrect database name '_xxx'` | Doris 库名不能以 `_` 开头 | 换个名字 |
 | `Communications link failure` | Doris 没起，或端口没发布 | `switch-mode.sh bi`；`docker ps` 看 9030 有没有映射 |
 | `Access denied for user` | 密码错，或账号不存在 | 用 `bi_ro`；root 是空密码，别填 `root` |
 | 中文维度值乱码 | JVM 字符集是 GBK | `finebi.vmoptions` 加 `-Dfile.encoding=UTF-8` |
