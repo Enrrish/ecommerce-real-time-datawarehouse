@@ -258,8 +258,8 @@ mode_bi() {
 
   hr
   echo "BI 模式下的连接参数（FineBI 在 Windows 宿主上，走发布端口）"
-  info "主机 127.0.0.1   端口 9030   用户 root   密码 空"
-  info "库   realtime_dw   驱动 MySQL 8（useSSL=false）"
+  info "主机 127.0.0.1   端口 9030   库 realtime_dw   驱动 MySQL 8（useSSL=false）"
+  info "账号 bi_ro / bi_ro_2026（只读，推荐）　或 root / 空密码"
   echo
   echo "直连的 7 张 ADS 表"
   info "ads_realtime_overview    88,157 行  分钟级 GMV/订单概览"
