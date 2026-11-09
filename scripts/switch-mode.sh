@@ -80,22 +80,52 @@ sum_limits() {
   echo "$total"
 }
 
+# docker stats 的 "662.3MiB" / "1.408GiB" → MB 整数
+mem_to_mb() {
+  awk -v s="$1" 'BEGIN{
+    if      (s ~ /GiB$/) { sub(/GiB$/,"",s); printf "%d", s*1024 }
+    else if (s ~ /MiB$/) { sub(/MiB$/,"",s); printf "%d", s }
+    else if (s ~ /KiB$/) { sub(/KiB$/,"",s); printf "%d", s/1024 }
+    else if (s ~ /B$/)   { sub(/B$/,"",s);   printf "%d", s/1048576 }
+    else                 { printf "0" }
+  }'
+}
+
+# 求和"实际占用"。容器没跑就按 0 算 —— 这是与 Docker Desktop 同一个口径。
+sum_used() {
+  local total=0 c used
+  for c in "$@"; do
+    used=$(d stats --no-stream --format '{{.MemUsage}}' "$c" 2>/dev/null | awk -F' / ' '{print $1}')
+    [[ -n "$used" ]] && total=$((total + $(mem_to_mb "$used")))
+  done
+  echo "$total"
+}
+
 mem_report() {  # $1=mode
-  local vm f fb total
+  local vm used limit over
   vm=$(vm_total_mb)
   if [[ -z "$vm" ]]; then warn "拿不到 Docker VM 内存（引擎没跑？）"; return 0; fi
 
   if [[ "$1" == "bi" ]]; then
-    f=$(sum_limits rt-doris-fe rt-doris-be)
-    fb=$(sum_limits rt-finebi)
-    total=$((f + fb))
+    used=$(sum_used rt-doris-fe rt-doris-be rt-finebi)
+    limit=$(sum_limits rt-doris-fe rt-doris-be rt-finebi)
   else
-    total=$(sum_limits rt-mysql rt-kafka rt-doris-fe rt-doris-be rt-flink-jm rt-flink-tm)
+    used=$(sum_used rt-mysql rt-kafka rt-doris-fe rt-doris-be rt-flink-jm rt-flink-tm)
+    limit=$(sum_limits rt-mysql rt-kafka rt-doris-fe rt-doris-be rt-flink-jm rt-flink-tm)
   fi
 
-  echo "  容器限额合计 ${total}MB / VM ${vm}MB，余 $((vm - total))MB"
-  if [[ $((vm - total)) -lt 512 ]]; then
-    warn "余量不足 512MB，起之前先想清楚（Doris BE 导入时会有峰值）"
+  # 两个口径必须分开说：一个是"现在吃了多少"，一个是"最多能吃多少"。
+  # 混在一起讲就会出现"Docker 说还剩 5GB，脚本说超了 1GB"这种自相矛盾。
+  echo "  实际占用 ${used}MB / VM ${vm}MB，余 $((vm - used))MB"
+  if [[ $((vm - used)) -lt 512 ]]; then
+    warn "实际剩余不足 512MB（Doris BE 导入时有峰值）"
+  fi
+
+  over=$((limit - vm))
+  if [[ "$over" -gt 0 ]]; then
+    info "限额合计 ${limit}MB，超卖 ${over}MB —— 允许，mem_limit 是每容器保险丝不是预占"
+  else
+    info "限额合计 ${limit}MB，余 $((vm - limit))MB"
   fi
 }
 
@@ -231,10 +261,13 @@ mode_bi() {
       [[ "$st" == "healthy" ]] && { echo " → healthy"; break; }
       if [[ "$(d inspect -f '{{.State.Status}}' rt-finebi 2>/dev/null)" == "exited" ]]; then
         echo " → 退出了"
-        # 最常见的原因：卷被重建后，WEB-INF/lib 里又变回 client 版 polars jar，
+        # 卷被重建后，WEB-INF/lib 里会变回原厂的 client 版 polars jar，
         # bi-web 就会在 cluster 初始化时抛 ClassNotFoundException 并 shutdown。
+        # 本项目的解法是**把 polars jar 移除**（Java 8 装不下 Java 11 的引擎），
+        # 不是补 jar —— 补了会变成 UnsupportedClassVersionError。
         if d logs rt-finebi 2>&1 | grep -q 'BIWorkerModule'; then
-          warn "缺 polars 引擎 jar（重建卷后会复发）—— 补法见 docs/note/27 §2.3"
+          warn "卷里又有 polars jar 了（重建卷后必复发）"
+          info "移除命令见 docs/note/27 §3.2；移除后 25 秒 healthy"
         fi
         break
       fi

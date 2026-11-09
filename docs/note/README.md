@@ -88,7 +88,7 @@ Doris 查询变慢翻 `16`。
 | 24 | [原生 JS 与 SVG 可视化](24-原生-JS-与-SVG-可视化.md) | DOM、fetch、轮询、手写 SVG、CSS Grid | 零依赖大屏，8 个面板 |
 | 25 | [可观测性与链路健康度](25-可观测性与链路健康度.md) | 黄金指标、判活口径、阈值设计 | 11 项指标写进 `ads_pipeline_health` |
 | 26 | [时延测量与压测](26-时延测量与压测.md) | 探针、分位数、端到端拆解 | 改一行 MySQL 到大屏可见的完整拆账 |
-| 27 | [FineBI 与内存预算](27-FineBI-与内存预算.md) | 容器化 BI 的组件拆分、JVM 堆外内存、cgroup OOMKill | 13GB FineOps 包怎么只取一个镜像；双模式切换的内存账 |
+| 27 | [FineBI 与内存预算](27-FineBI-与内存预算.md) | 容器化 BI 的组件拆分、JVM 堆外内存、cgroup OOMKill、两个内存口径 | 13GB FineOps 包怎么只取一个镜像；Java 8/11 死结；双模式切换的内存账 |
 
 ---
 
@@ -110,6 +110,8 @@ Doris 查询变慢翻 `16`。
 | 想验证「改了之后真的生效」 | `21`（正向对照）、`26`（端到端拆账） |
 | 想接个 BI 工具看数据，怕内存不够 | `27`（组件拆分、内存测算、双模式切换） |
 | 容器起 20 秒就退出，退出码 1，日志停在 `cluster start` | `27`（缺 polars 引擎 jar；stdout 被重定向，真日志在 `logs/fanruan.log`） |
+| `UnsupportedClassVersionError` 55.0 vs 52.0 | `27`（引擎 jar 是 Java 11，web 是 Java 8，装不到一个 JVM 里） |
+| 明明还剩 5GB，脚本却说内存超了 | `27`（实际占用 vs 限额合计，两个口径） |
 | 两份 compose 互相报 `orphan containers` | `27`（项目名冲突） |
 
 ---

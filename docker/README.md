@@ -60,11 +60,15 @@ docker/
 ```
 
 > **`docker-compose.finebi.yml` 为什么不写进主 compose**：FineBI 的 JVM 自检要求
-> `Xmx + Direct + Metaspace + CodeCache ≤ 容器内存`，厂商那四项加起来 7680MB 且一项
-> 都压不得，所以它的 `mem_limit` 下限就是 7808MB；而主栈 6 个容器已经占了
+> `Xmx + Direct + Metaspace + CodeCache ≤ 容器内存`，厂商那四项加起来 7680MB，
+> 所以它的 `mem_limit` 下限就是 7808MB；而主栈 6 个容器已经占了
 > 8960MB / 9947MB，两套加起来远超 VM。所以它是一份独立的 compose，
 > 用独立的项目名 `rt-bi`（否则两边互相报 `orphan containers`），共用 `rt-net` 网络
 > （`external: true`）才能用 `doris-fe:9030` 这个服务名接数据源。
+>
+> 另外：容器里的 **polars 引擎 jar 是被移除的**（`WEB-INF/lib.disabled/`）。
+> `bi-web` 绑定 Java 8、polars 引擎绑定 Java 11，同一个 JVM 装不下，只留内置 spider 引擎。
+> **卷重建后要重新移除一次**，命令见 `docs/note/27` §3.2。
 >
 > 切换用 `bash scripts/switch-mode.sh bi|realtime`。实测数据和选型依据见
 > [`docs/note/27-FineBI-与内存预算.md`](../docs/note/27-FineBI-与内存预算.md)。

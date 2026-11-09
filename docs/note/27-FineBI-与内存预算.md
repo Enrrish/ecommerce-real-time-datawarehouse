@@ -3,9 +3,15 @@
 > 这篇记录一次真实的技术选型：拿到一个 13GB 的「FineBI 离线部署包」，要判断这台 16GB 的机器能不能跑，
 > 最后怎么跑。结论是**能跑，但不是按包的设计意图跑**——包里那套东西的官方最低配置是 64GB。
 >
-> 中途踩了两个坑，都在正文里留了完整复盘：一是 `bi-web` 单镜像**缺一个 341MB 的引擎 jar**
-> （厂商发布包的结构问题，`docker logs` 会骗人）；二是它的**启动自检**要求
-> 四项 JVM 内存参数之和不超过容器限额，因此 `mem_limit` 有个 7808MB 的硬下限。
+> 中途踩了三个坑，都在正文里留了完整复盘：
+>
+> 1. `bi-web` 单镜像**缺一个 341MB 的引擎 jar**（发布包的结构问题，且 `docker logs` 会骗人）
+> 2. 补上 jar 之后才发现更硬的一层：**那个 jar 是 Java 11 编译的，而 `bi-web` 离不开 Java 8**
+> 3. 启动自检要求四项 JVM 内存参数之和不超过容器限额，所以 `mem_limit` 有个 7808MB 的硬下限
+>
+> 第 2 条是这篇最贵的一课：我一开始以为"换个 JDK 就行"，实测连踩三个子坑才确认
+> **`bi-web` 与 polars 引擎不可能共存于一个 JVM**。最终做法是把 polars 整个移除，
+> 退回内置的 spider 引擎（见 2.4）。
 >
 > 全文只有两个数字来源：帆软官方文档，和本机实测。凡是估的都会写明是估的。
 
@@ -181,7 +187,7 @@ CPU 16 核 / 内存 64GB / 磁盘 500GB
 
 **64GB 是这台机器的 4 倍。** 而且引擎节点是强制的，不能只起 web（见 §2.3 的证据）。
 
-### 2.3 只起 bi-web 行不行？——不行，它缺一个 341MB 的 jar
+### 2.3 只起 bi-web 行不行？——缺一个 341MB 的 jar，补了也不行
 
 把 `bi70all` 和 `bi61all` 都 load 进来，各得到 4 个镜像。看 `bi-web` 里有什么：
 
@@ -238,12 +244,148 @@ docker run --rm -v "D:/…:/src:ro" -v rt-finebi-webroot:/w alpine sh -c '
 ```
 
 换完 `docker logs` 里 `polars mini cluster error` 从有到无，重启两次都是 25 秒 healthy。
+**到这里我以为问题解决了。其实只是把第一层盖子揭开。**
 
 > 这是发布包的结构问题，不是配置错误：引擎类只打在 worker 镜像里，而 `bi-web` 的
 > `LocalMiniProcessStart` 写死了要加载它。官方推荐的四容器部署（web + master + worker + minio）
 > 下引擎由 worker 提供，踩不到这条路；单容器属于非预期用法，所以厂商没覆盖到。
 
-### 2.4 那次"静默退出"，真凶是缺类，不是参数
+**补完 jar 的第一个坏消息**：容器能起、页面能开，但部署向导报 `BI_Design_Engine_Error`。
+翻 `logs/fanruan.log`：
+
+```
+java.lang.UnsupportedClassVersionError: com/fanruan/polars/core/XPath
+  has been compiled by a more recent version of the Java Runtime (class file version 55.0),
+  this version of the Java Runtime only recognizes class file versions up to 52.0
+	at com.finebi.activate.environment.checker.PolarsEnvironmentChecker.check(PolarsEnvironmentChecker.java:34)
+```
+
+- class file version **55.0** = Java 11
+- 52.0 = Java 8
+
+```bash
+$ docker exec rt-finebi java -version
+openjdk version "1.8.0_492"          # bi-web 是 Java 8
+
+$ docker run --rm --entrypoint sh bi-engine-worker:6.1-… -c 'java -version'
+openjdk version "11.0.31"            # engine 镜像才是 Java 11
+```
+
+**engine jar 是 Java 11 编译的，`bi-web` 跑在 Java 8 上。** 这不是打错包，
+是厂商把运行时按 JDK 版本切开了 —— 接下来 2.4 会证明 `bi-web` 根本离不开 Java 8。
+
+### 2.4 补了 jar 之后：Java 8 与 Java 11 是个死结
+
+既然缺的是 Java 11，那就给它 Java 11。两个镜像的 `JAVA_HOME` 恰好都是
+`/opt/java/openjdk`，路径完全一致，把 worker 的 JDK 拷成卷挂上去就能透明覆盖：
+
+```bash
+docker volume create rt-java11
+docker run --rm --entrypoint sh -v rt-java11:/dest bi-engine-worker:6.1-… \
+  -c 'cp -a /opt/java/openjdk/. /dest/'      # 268MB，约 6 秒
+```
+
+覆盖后 `java -version` 确实变成 `11.0.31`，然后**连踩三个坑，一个比一个深**：
+
+**坑一：entrypoint 硬拼 Java 8 的 GC 参数**
+
+```
+Unrecognized VM option 'PrintGCDateStamps'
+Error: Could not create the Java Virtual Machine.
+```
+
+来源是 `/docker-entrypoint.sh` 第 117 行：
+
+```bash
+JAVA_OPTS="$JAVA_OPTS -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+UseGCLogFileRotation $FINE_OPTS"
+JAVA_OPTS="$JAVA_OPTS -Xloggc:${GC_LOG_PATH}/gc.%t.log ..."
+```
+
+`PrintGCDateStamps` / `UseGCLogFileRotation` 在 JDK 9 就被移除了。加一句
+`-XX:+IgnoreUnrecognizedVMOptions` 可以静默跳过它们，而 `-Xloggc` 和 `PrintGCDetails`
+在 Java 11 里是 deprecated 别名，会自动映射成 `-Xlog:gc`：
+
+```bash
+$ java -XX:+IgnoreUnrecognizedVMOptions -XX:+PrintGCDateStamps -Xloggc:/tmp/gc.log -version
+[warning][gc] -Xloggc is deprecated. Will use -Xlog:gc:/tmp/gc.log instead.
+openjdk version "11.0.31"            # 能起
+```
+
+**坑二：FineAssist 是 JNI native agent，只认 Java 8**
+
+JVM 起来后日志里刷 `Fine assist start failed`：
+
+```
+Caused by: java.io.IOException: Can not attach to current VM
+	at com.fr.jvm.assist.FineAssist.<clinit>(FineAssist.java:62)
+	at com.fr.decision.deployment.foundation.impl.AbstractFoundationChecker.checkAssist(...)
+```
+
+Java 9+ 默认禁止 VM 自附加（Java 8 允许）。看着像是加个
+`-Djdk.attach.allowAttachSelf=true` 就完事 —— 我加了，然后**问题变得更糟**：
+
+```
+Caused by: java.lang.ClassFormatError: Incompatible magic value 2751307326
+  in class file com/fr/plugin/manage/PluginManager
+	at WebappClassLoaderBase.findClassInternal
+→ LifecycleException: 无法启动组件 StandardContext[/webroot]
+```
+
+`magic value` 每次都不一样（第二次是 `50661129`，类名变成 `FinePluginBridge`），
+这是**内存层面的随机污染**。查 `FineAssist` 的方法签名就明白了：
+
+```java
+private static final String[] NATIVE_LIBS;
+private static native int forceGC();
+public static native int signature();
+```
+
+它带 native 库（`.so`），而那个 `.so` 是按 Java 8 编译的。attach 失败时它是**安全降级**的，
+一旦 attach 成功，native 层的不兼容就会踩坏数据。**所以 `allowAttachSelf` 不该加。**
+
+**坑三：`.classx` —— 厂商的类加密格式**
+
+去掉 `allowAttachSelf` 后 `StandardContext` 能起来了，但还有零星的 `ClassFormatError`。
+去 jar 里翻：
+
+```bash
+$ jar tf fine-core-11.0.jar | grep FinePluginBridge
+com/fr/plugin/bridge/FinePluginBridge.classx
+com/fr/plugin/bridge/FinePluginBridge__1.classx
+```
+
+**后缀是 `.classx` 不是 `.class`** —— FineBI 有自己的一套类加密，运行时解密后再 defineClass。
+Java 11 下这套封装失效，密文被直接当成 class 读，于是报 `Incompatible magic value`。
+
+**这三个坑指向同一个结论**：`bi-web` 镜像是**绑定 Java 8** 的 —— 类解密、native agent、
+启动脚本的 GC 参数，全都只为 Java 8 准备；而 polars 引擎是 Java 11 编译的。
+**两者不可能塞进同一个 JVM。**
+
+于是有了第四条路，也是最终采用的那条：**既然引擎在这个镜像里注定跑不起来，就别让它存在。**
+
+```bash
+# 把 polars 的 jar 整个移走，只留内置的 spider 引擎
+docker run --rm -v rt-finebi-webroot:/w alpine sh -c '
+  mkdir -p /w/WEB-INF/lib.disabled
+  mv /w/WEB-INF/lib/fine-bi-engine-polars-6.1.jar /w/WEB-INF/lib.disabled/'
+```
+
+移走之后（`lib` 从 35 个变 34 个，`fine-bi-engine-spider-6.1.jar` 588KB 留着）：
+
+| 指标 | 移走前（Java 11 + engine jar） | 移走后（Java 8 + 无 polars） |
+| --- | --- | --- |
+| 容器状态 | running / unhealthy | **running / healthy，25 秒** |
+| `/system/health` | 400（`Fine module health recorder is null`） | **200** |
+| `BIWorkerModule` 报错 | 0（被 Java 11 绕过） | **0** |
+| `ClassFormatError` | 多次，随机 | **0** |
+| 空载内存 | 1.55 GiB | 1.587 GiB |
+
+> 这一步的代价：**polars 加速引擎用不了，只剩 spider 引擎**。
+> 对 11 万行这个数据量没有实际影响；如果以后要做大数据量分析，正确做法是
+> 按厂商设计起 `bi-engine-master` + `bi-engine-worker` 两个独立容器，
+> 让它们用各自的 Java 11，而不是把 Java 11 塞进 web。
+
+### 2.5 那次"静默退出"，真凶是缺类，不是参数
 
 第一版 compose 起容器，20 秒后**退出码 1**，`docker logs` 停在：
 
@@ -297,7 +439,7 @@ CacheManager-GlobalShutdownHook INFO  CacheManager global JVM shutdown hook trig
 **可靠的排查顺序**：`docker cp` 整个 `/usr/local/tomcat/logs` 出来，按修改时间找最新的
 `*.log`，grep `ERROR|Exception`。`docker logs` 只覆盖 stdout 那一段，仅够看启动进度。
 
-### 2.5 部署向导报「JVM参数配置存在问题」
+### 2.6 部署向导报「JVM参数配置存在问题」
 
 容器起来、页面能开之后，`/webroot/decision/v10/deployment/recommendation` 会红字报：
 
@@ -341,7 +483,7 @@ VM 内 `MemAvailable` 还剩 5.6 GB。真实天花板由 `.wslconfig` 的 10 GB 
 > 这个检查只看**四项配置的和**，不是看实际占用。所以"我明明只用 1.6GB"不构成申诉理由——
 > 它防的是极端负载下 JVM 把承诺的上限全用光然后被 cgroup 打死。
 
-### 2.6 内存测算
+### 2.7 内存测算
 
 | 项 | 数值 | 来源 |
 | --- | --- | --- |
@@ -350,7 +492,7 @@ VM 内 `MemAvailable` 还剩 5.6 GB。真实天花板由 `.wslconfig` 的 10 GB 
 | Docker VM 实见 | **9947 MB** | `docker info` / `grep MemTotal /proc/meminfo` |
 | 实时模式 6 容器限额 | **8960 MB** | `docker inspect .HostConfig.Memory` 求和 |
 | 实时模式余量 | 987 MB | 9947 − 8960 |
-| FineBI 空载实测 | **1631 MB** | `docker stats`（含引擎 jar 后） |
+| FineBI 空载实测 | **1587 MB** | `docker stats`（移走 polars jar 后，见 2.4） |
 | FineBI 容器限额 | **7808 MB** | compose `mem_limit`，由 JVM 自检下限 7680 反推 |
 
 **如果两套同时开**：8960 + 7808 = 16768MB > 9947MB，超 6821MB。**共存这条路是堵死的。**
@@ -359,7 +501,7 @@ VM 内 `MemAvailable` 还剩 5.6 GB。真实天花板由 `.wslconfig` 的 10 GB 
 （6 个容器厂商推荐值相加），而 7808 是 FineBI 的**下限**——低于它 JVM 自检直接报红。
 两个数接近但来路完全不同，别当成"同一档"。
 
-### 2.7 最终方案：二选一，而不是共存
+### 2.8 最终方案：二选一，而不是共存
 
 ```
 实时模式（realtime）           BI 分析模式（bi）
@@ -369,7 +511,7 @@ kafka        768              doris-be      1792
 doris-fe    1536              finebi        7808
 doris-be    1792              ────────────────────
 flink-jm     768                       合计 11136
-flink-tm    3328                          （超卖，见 2.5）
+flink-tm    3328                          （超卖，见 2.7）
 ─────────────────
         合计 8960
 ```
@@ -393,18 +535,37 @@ bash scripts/switch-mode.sh realtime        # 起 6 容器，停 FineBI
 bash scripts/switch-mode.sh realtime --submit   # 顺带把 4 个作业提起来
 ```
 
-### 2.8 实测结果
+### 2.9 实测结果
 
 BI 模式下三个容器的真实占用：
 
 | 容器 | 实测 | 限额 | 使用率 |
 | --- | --- | --- | --- |
-| rt-doris-fe | 657 MiB | 1536 MiB | 43% |
-| rt-doris-be | 1514 MiB | 1792 MiB | 85% |
-| rt-finebi | 1631 MiB | 7808 MiB | 21% |
-| **合计** | **3802 MiB** | 11136 MiB | — |
+| rt-doris-fe | 665 MiB | 1536 MiB | 43% |
+| rt-doris-be | 1408 MiB | 1792 MiB | 80% |
+| rt-finebi | 1587 MiB | 7808 MiB | 21% |
+| **合计** | **3660 MiB** | 11136 MiB | — |
 
 VM 内 `MemAvailable` 还有 **5.6 GiB**。限额离实际用量的距离，就是"纸面超卖"仍然安全的余量。
+
+**这里必须分清两个口径** —— 混在一起讲就会自相矛盾：
+
+| 口径 | 怎么算 | 数值 | 语义 |
+| --- | --- | --- | --- |
+| **实际占用** | `docker stats` 的 `MemUsage` 求和 | 3660 MB | 现在真的吃了多少 |
+| **限额合计** | `docker inspect .HostConfig.Memory` 求和 | 11136 MB | 最多**允许**吃多少 |
+
+Docker Desktop 的 `3.68GB / 9.49GB` 是前者，`switch-mode.sh` 早期版本报
+`11136MB / 9947MB，余 -1189MB` 是后者。两个数都对，只是回答的不是同一个问题。
+
+早期脚本只算限额，于是明明还剩 5.6GB，却报"超了 1189MB"—— 判断依据用错了地方。
+现在脚本两个都报，主行是实际占用：
+
+```
+==> 内存
+  实际占用 3660MB / VM 9947MB，余 6287MB
+    限额合计 11136MB，超卖 1189MB —— 允许，mem_limit 是每容器保险丝不是预占
+```
 
 连通性验证：
 
@@ -415,7 +576,7 @@ $ docker exec rt-finebi bash -c 'exec 3<>/dev/tcp/doris-fe/9030'
 9030 可达
 ```
 
-### 2.9 FineBI 接 Doris
+### 2.10 FineBI 接 Doris
 
 Doris FE 的 9030 是 MySQL 协议，FineBI 直接当 MySQL 数据源接，**不用额外起 MySQL**：
 
@@ -450,7 +611,11 @@ tar -xzf finekey-amd64-tomcat-all-publish.tar.gz -C /d/finebi-pkg \
 docker load -i /d/finebi-pkg/finekey/resources/images/bi61all-tomcat-amd64-publish.tgz
 ```
 
-`docker load` 一个 2GB 的 tgz 约 3 分钟。load 完记得删掉解出来的 tgz（`/d/finebi-pkg` 可以整个删）。
+`docker load` 一个 2GB 的 tgz 约 3 分钟。load 完可以删掉解出来的 tgz。
+
+但 `/d/finebi-pkg` 里那个 341MB 的 `fine-bi-engine-polars-6.1.jar` **先别删**：
+它是从 worker 镜像里单独提取的，将来若改走官方三容器方案，直接从这里取，不用再解 13GB 的包。
+（卷里 `WEB-INF/lib.disabled/` 也留了一份。）
 
 ### 3.2 常用命令
 
@@ -465,6 +630,17 @@ docker stats --no-stream rt-finebi rt-doris-fe rt-doris-be
 
 # 看 JVM 实际生效的堆参数（别信 compose，信 ps）
 docker exec rt-finebi ps -ef | grep -o '\-Xmx[0-9a-zA-Z]*'
+
+# 看 JVM 是几 —— 排查 UnsupportedClassVersionError 的第一步
+docker exec rt-finebi java -version
+
+# 看 polars 引擎 jar 是被启用还是被禁用（本项目最终是禁用）
+docker run --rm -v rt-finebi-webroot:/w alpine sh -c \
+  'ls /w/WEB-INF/lib/ /w/WEB-INF/lib.disabled/ 2>/dev/null | grep -i polars'
+
+# 恢复 polars jar（只在要改走"官方三容器"时才需要）
+docker run --rm -v rt-finebi-webroot:/w alpine sh -c \
+  'mv /w/WEB-INF/lib.disabled/fine-bi-engine-polars-6.1.jar /w/WEB-INF/lib/'
 
 # 看 FineBI 业务日志 —— 注意不是 FineLog/（那里只有 gc/safepoint/hs_err）
 docker exec rt-finebi sh -c 'ls -lt /usr/local/tomcat/logs/*.log | head -3'
@@ -482,11 +658,16 @@ curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' \
 | --- | --- | --- |
 | 容器 20 秒后退出，**退出码 1**，`docker logs` 断在 `cluster update activator start` | `bi-web` 缺 polars 引擎 jar，加载不到 `com.fanruan.polars.bi.BIWorkerModule` | `docker cp rt-finebi:/usr/local/tomcat/logs .`，grep `fanruan.log` 里的 `Exception` |
 | 同上，但 `FineLog/` 里只有 gc/safepoint | 正常。JVM 级日志在 `FineLog/`，**业务日志在 `logs/` 根** | 别在 `FineLog/` 里找业务栈 |
+| 补了 engine jar 后报 `UnsupportedClassVersionError`，`55.0` vs `52.0` | 那个 jar 是 **Java 11** 编译（55.0），`bi-web` 跑 **Java 8**（52.0） | `docker exec rt-finebi java -version` 对比 jar 的 class 版本 |
+| `Unrecognized VM option 'PrintGCDateStamps'` | `/docker-entrypoint.sh` 硬拼了 Java 8 的 GC 参数（JDK 9 已移除） | 只在换了 Java 11 后出现，Java 8 下正常 |
+| `ClassFormatError: Incompatible magic value <每次不同的数>` | 两种来源：① Java 11 下 `FineAssist` 的 native agent 踩内存；② `fine-core-11.0.jar` 里 `*.classx` 加密类在 Java 11 下解不开 | 数值随机 + 类名随机 = 内存污染；类名固定 = `.classx`，`jar tf \| grep classx` 可证 |
+| `/system/health` 返回 **400**，body 写 `Fine module health recorder is null` | cluster 模块没完整启动（通常是上面那些类加载失败的连带） | 先修类加载，再测 health；`decision` 302 不代表健康 |
 | 部署向导红字「JVM参数配置存在问题」 | `Xmx + Direct + Metaspace + CodeCache` > `mem_limit` | 四项相加与限额比；本例 7680 vs 7808 |
 | 退出码 **137** | 超 `mem_limit`，被内核 SIGKILL | `OOMKilled=true` 就是它 |
 | `Found orphan containers (rt-finebi)` | 两份 compose 项目名相同 | compose 顶层加 `name:` |
 | `network rt-net not found` | 主栈没起过，external 网络不存在 | 先起一次 Doris |
 | 卷报 `created for project "docker" (expected "rt-bi")` | 改了项目名，卷 label 没变 | 有数据改 `external: true`，无数据删卷重建 |
+| **Docker Desktop 说还剩 5GB，脚本说超了 1GB** | 两个口径：前者是实际占用，后者是限额之和 | 见 2.9；看 `docker stats`，不是 `HostConfig.Memory` |
 | FineBI 里连不上 Doris | 数据源写了 `localhost` | 容器内 localhost 是容器自己，必须写 `doris-fe` |
 | `docker exec` 里路径变成 `D:/…` | Git Bash 把容器路径翻译成 Windows 路径 | 加 `MSYS_NO_PATHCONV=1` |
 | `docker cp` 报 `directory "c:\tmp" does not exist` | 上一条的反面：`MSYS_NO_PATHCONV=1` 又关掉了 POSIX→Windows 翻译 | 目标写 Windows 形式 `"D:/finebi-pkg/x"` |
@@ -502,7 +683,8 @@ curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' \
    `mem_limit` 可降到 6784。代价是复杂仪表板并发时 GC 变频繁
 2. **Metaspace 降到 1024m** —— 实测只用 132MB，表面上还有七倍余量。但**没实测**，
    改了要重跑"起容器 + 看自检红字"两步。注意早期那次 1024 失败过，
-   但那是 polars 缺类的竞态（见 2.4），**不能当作"1024 不行"的证据**
+   但那是 polars 缺类的竞态（见 2.5），**不能当作"1024 不行"的证据**；
+   现在 polars jar 已经移除（2.4），这条路比当时干净
 3. **FineBI 用外接 MySQL 配置库** —— 能省 HSQLDB 的内存，但要多起一个 MySQL，**不划算**
 4. **Tomcat 线程数调小** —— `TOMCAT_MAX_THREADS` 默认 500，改 100 能省线程栈
 5. **不推荐**：把 `.wslconfig` 提到 12GB 让两套共存 —— Windows 只剩 3.6GB，
