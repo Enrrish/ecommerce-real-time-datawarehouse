@@ -113,7 +113,8 @@ FineBI 容器，空载只占 **1.54GB**。所以：
 **（1）项目名（project name）**
 
 compose 默认用**所在目录名**当项目名。`docker/docker-compose.yml` 和
-`docker/docker-compose.finebi.yml` 都在 `docker/` 下，于是**项目名相同**，后果：
+`docker/docker-compose.finebi.yml`（该文件已于 2026-11-09 删除，见 2.12，此处只是当时的情形）
+都在 `docker/` 下，于是**项目名相同**，后果：
 
 - 两边 `up` 都会警告 `Found orphan containers (…)：这个容器不属于我的服务列表`
 - 一个项目的 `down --remove-orphans` 会把另一个项目的容器当垃圾删掉
@@ -710,12 +711,13 @@ lib 里是完整的 Java 8 实现），不是这个集群镜像包。
 
 ### 2.12 收尾：这条路线被砍掉了
 
-2026-11-09 下午，按上面的结论执行了清理：
+2026-11-09 下午，按上面的结论执行了清理。**下面三段命令已经跑过，`docker-compose.finebi.yml`
+也已从仓库删除** —— 留在这里只是记录清理步骤，现在照抄会在 `down` 和 `rm` 两步报文件不存在：
 
 ```bash
 docker compose -f docker-compose.finebi.yml down -v   # 三个容器 + 三个卷
 docker volume rm rt-java11                            # 早期试 Java 11 的遗留卷
-rm docker/docker-compose.finebi.yml
+rm docker/docker-compose.finebi.yml                   # 文件已不存在，此步不用再跑
 ```
 
 同时 `scripts/switch-mode.sh` 的 `bi` 模式改成"只留 Doris"，Windows 侧的
