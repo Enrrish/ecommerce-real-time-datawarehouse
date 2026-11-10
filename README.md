@@ -71,6 +71,10 @@ bash scripts/stop.sh
 想验证「改一行真的会传到大屏」：`bash scripts/demo-change.sh`（先自检作业是否真在产出，
 再改一行、量出 DWS / ADS / 面板各自的时延、最后自动改回去）。
 
+想把机器让给 BI 做自助分析：`bash scripts/switch-mode.sh bi`（停 Flink / Kafka / MySQL，
+只留 Doris 约 3.3GB），分析完 `switch-mode.sh realtime` 切回来。三页驾驶舱怎么复刻见
+[docs/06](docs/06-可视化驾驶舱.md)，内存账见 [note 27](docs/note/27-FineBI-与内存预算.md)。
+
 ---
 
 ## 1. 项目目标
@@ -147,6 +151,7 @@ flowchart LR
 | MySQL | **8.0.36** | 业务库（OLTP 源），binlog `ROW` + `FULL` |
 | Docker Desktop / Engine | **4.97.0 / 29.9.2** | 环境编排，profile 分层启动 |
 | Python | 3.11 | 数据装载与埋点生成脚本 |
+| FineBI | **6.1 单机版（Windows 侧）** | 可选：BI 分析模式下直连 ADS 做自助分析，与实时链路二选一（`scripts/switch-mode.sh`） |
 
 ---
 
@@ -156,17 +161,21 @@ flowchart LR
 .
 ├── data/                  # 数据集（原始数据不入库，见 data/README.md）
 │   └── raw/olist/         # Olist 9 个 CSV，已 gitignore
-├── docker/                # 容器编排与环境配置
+├── docker/                # 容器编排
 │   ├── docker-compose.yml # 三 profile：source / compute / olap
-│   ├── volumes/           # MySQL / Kafka / Doris / Flink 状态目录（gitignore）
+│   ├── be-conf/be.conf    # BE 配置（trash 保留期等），只读挂进容器
+│   ├── volumes/           # MySQL / Kafka / FE 的数据目录（gitignore；BE 用命名卷）
 │   └── flink/lib/         # 四个 connector jar，由脚本下载（gitignore）
 ├── sql/
 │   ├── mysql/             # 业务库建表 01-schema + 验收 02-verify
 │   └── doris/             # 四层建表 01/03/05/07 + 刷新 08 + 验收 02/06/09
 ├── flink/sql/             # Flink SQL 作业，按分层编号
-├── scripts/               # 数据装载、埋点生成、jar 下载、作业提交、健康度采集、一键启动
+├── scripts/               # 一键起停 / 装载 / 埋点 / jar / 作业提交 / 健康度 / 改数验收 / 延迟采样
 ├── dashboard/             # 实时大屏：静态页 + Python 查询代理 + 四档 ADS 刷新
-└── docs/                  # 架构、分层模型、指标口径、环境、路线图
+└── docs/
+    ├── 01~06-*.md         # 架构、分层模型、指标口径、环境、路线图、可视化驾驶舱
+    ├── note/              # 28 篇技术笔记（索引见 docs/note/README.md）
+    └── assets/            # 大屏截图、三页驾驶舱设计稿
 ```
 
 ---
@@ -192,7 +201,8 @@ flowchart LR
 | [**docs/note/**](docs/note/README.md) | **技术笔记：28 篇，每项技术先讲通用知识再讲本项目用法** |
 
 > `docs/01`~`06` 回答"为什么这么设计"，`docs/note/` 回答"这个技术怎么用、报错怎么解"。
-> 环境起不来查 note 的 `02`/`03`；作业不写数据查 `11`/`12`；Doris 查询变慢查 `16`。
+> 环境起不来查 note 的 `02`/`03`；作业不写数据查 `11`/`12`；Doris 查询变慢查 `16`；
+> BI 接入与两套内存配置查 `27`/`28`。
 
 ---
 
@@ -213,6 +223,9 @@ flowchart LR
 - [x] 大屏接入 ADS 实数据（三屏九块全真数据；改 MySQL → 大屏 **294~4,019 ms**，P7 口径 = 主动触发 ADS 刷新）
   - 不触发刷新、只等 60s 批刷周期的真实等待是 **17~60s**，两个都对，别混着引（见 [docs/03 §实测基线](docs/03-指标口径.md)）
 - [x] 一键启动脚本 `demo.sh` 与端到端延迟真采样 `check_lag.py`（P8）
+- [x] 技术笔记 28 篇（[docs/note/](docs/note/README.md)，按技术栈组织，编号即阅读与依赖顺序）
+- [x] 三页经营驾驶舱设计稿 + 逐图字段清单与口径（[docs/06](docs/06-可视化驾驶舱.md)）
+- [x] FineBI 6.1 单机版接入 ADS，BI 分析模式与实时模式二选一（`scripts/switch-mode.sh`）
 
 ---
 
