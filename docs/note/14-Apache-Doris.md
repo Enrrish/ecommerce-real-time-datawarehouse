@@ -50,8 +50,8 @@ database
 关键推论：
 
 - **分区裁剪**按 partition 走，分桶决定并行度
-- **一次导入 = 一个 rowset = 一个数据版本**，版本多了要 compaction（见 `16`）
-- 唯一性只在 **tablet 内**保证 → 同一主键落在不同分区会出现两行（见 `15`）
+- **一次导入 = 一个 rowset = 一个数据版本**，版本多了要 compaction（见 [16](16-Doris-分区-分桶与-Compaction.md)）
+- 唯一性只在 **tablet 内**保证 → 同一主键落在不同分区会出现两行（见 [15](15-Doris-数据模型.md)）
 
 ### 1.4 三种导入方式
 
@@ -245,8 +245,8 @@ docker exec rt-doris-be sh -c "curl -s http://localhost:8040/varz | grep -E 'tra
 | `no scanNode Backend available[10227]` | BE 刚重启，等 90~100 秒 |
 | `SHOW BACKENDS` 里 Alive=false | 真的挂了，看 BE 日志 |
 | 建表成功但写不进去 | `replication_num` 不是 1 |
-| 查询结果比预期少 | 分区裁剪把数据裁掉了（见 `16`） |
-| 导入报 `filtered data in strict mode` | 列超长/类型不符（见 `15`） |
+| 查询结果比预期少 | 分区裁剪把数据裁掉了（见 [16](16-Doris-分区-分桶与-Compaction.md)） |
+| 导入报 `filtered data in strict mode` | 列超长/类型不符（见 [15](15-Doris-数据模型.md)） |
 
 延伸：`15-Doris-数据模型.md`、`16-Doris-分区-分桶与-Compaction.md`、
 `17-Stream-Load-与-Doris-Sink.md`、`../01-架构设计.md`

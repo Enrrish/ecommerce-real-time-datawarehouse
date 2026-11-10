@@ -104,7 +104,7 @@ docker compose down -v          # 删容器 + 网络 + **卷**
 ```
 
 `docker exec` 有固定开销（本项目实测 **826ms/次**，其中大部分是 exec 握手 + shell 启动）。
-所以不能在采样循环里每次 `exec` 一次 —— 详见 `23` 的常驻管道。
+所以不能在采样循环里每次 `exec` 一次 —— 详见 [23](23-HTTP-服务与大屏后端.md) 的常驻管道。
 
 ### 1.6 只读挂载
 
@@ -217,7 +217,7 @@ docker exec rt-kafka /usr/bin/awk '...'
 compose 里给每个服务加了 `TZ: Asia/Shanghai`，它改的是容器内 `/etc/localtime`
 与 `date` 的输出。**数据库里存的值由列类型和连接参数决定**，不受 `TZ` 影响 ——
 MySQL 的 `DATETIME` 无时区，Flink 要单独设 `table.local-time-zone`
-和 `server-time-zone`（见 `11`）。曾经因为只设了 `TZ` 而漏了 JDBC 的时区，
+和 `server-time-zone`（见 [11](11-Flink-CDC.md)）。曾经因为只设了 `TZ` 而漏了 JDBC 的时区，
 导致抽到 Doris 后所有时间整体偏 8 小时。
 
 ---

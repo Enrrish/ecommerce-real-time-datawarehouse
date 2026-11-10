@@ -174,7 +174,7 @@ DWS 表最大 8.8 万行，MoW 的读路径与 AGGREGATE 差别可以忽略。
 | ADS | `ads_order_stream` | `order_id` | 订单 |
 
 `dim_user_zip` 的主键值得单独看：`(customer_unique_id, start_date)` —— 拉链表的
-"一个用户的多个版本"天然是复合主键，`start_date` 是版本标识（见 `19`）。
+"一个用户的多个版本"天然是复合主键，`start_date` 是版本标识（见 [19](19-维度建模与拉链表.md)）。
 
 ### 2.4 `dt` 为什么排在第 2 列
 
@@ -220,7 +220,7 @@ UNIQUE KEY(`event_id`, `dt`)
 但 INSERT INTO 会把它上一次的行留在表里 → 排行里挂着一个已不存在的类目
 ```
 
-刷全量必须 `INSERT OVERWRITE`（见 `17`）。
+刷全量必须 `INSERT OVERWRITE`（见 [17](17-Stream-Load-与-Doris-Sink.md)）。
 
 **坑 3：删 MySQL 的行不会让 Doris 已聚合的行消失**
 

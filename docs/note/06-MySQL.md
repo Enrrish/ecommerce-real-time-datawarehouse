@@ -65,7 +65,7 @@ DOUBLE          -- 二进制浮点，0.1+0.2 != 0.3
 ### 1.4 严格模式与 `sql_mode`
 
 MySQL 5.7+ 默认 `STRICT_TRANS_TABLES`：超长、类型不符、非空插 NULL 都**报错**而不是截断。
-这是好事，但要注意它的报错常常不带列名（Doris 也是，见 `15`）。
+这是好事，但要注意它的报错常常不带列名（Doris 也是，见 [15](15-Doris-数据模型.md)）。
 
 ```sql
 SELECT @@sql_mode;

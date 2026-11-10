@@ -23,7 +23,7 @@
 本项目的原则：**只有"必须"才引入第三方**。`requirements.txt` 里只有 `kafka-python`。
 
 好处：换机器不用装环境；坏处：`http.server` 这种"玩具级"服务器要自己补缓存头、
-自己做连接复用（见 `23`）。
+自己做连接复用（见 [23](23-HTTP-服务与大屏后端.md)）。
 
 ### 1.2 `argparse` 的三种参数类型
 
@@ -97,7 +97,7 @@ except json.JSONDecodeError as e:
 ```
 
 本项目踩过的具体案例：`FileNotFoundError` 被 `2>/dev/null`（shell 层）吞掉，
-导致一个指标静默退回硬编码常量，只在某条调用路径上发生（见 `26`）。
+导致一个指标静默退回硬编码常量，只在某条调用路径上发生（见 [26](26-时延测量与压测.md)）。
 
 ### 1.6 持续运行的脚本：三件事
 
@@ -184,7 +184,7 @@ product_id 取自 olist_products，user_id 取自 customer_unique_id
 现象：生产了几万条，漏斗只统计到一半，极难排查
 ```
 
-第三条是"数据源的问题在数据源修"的典型（见 `13`）。
+第三条是"数据源的问题在数据源修"的典型（见 [13](13-时间语义与-Watermark.md)）。
 
 ### 2.4 可注入的脏数据
 
@@ -198,7 +198,7 @@ product_id 取自 olist_products，user_id 取自 customer_unique_id
 - `--dup-rate` 验证 UNIQUE 模型的幂等
 - `--late-rate` 验证 `late_ratio` 指标能算对（配合正向对照）
 
-**注入量必须可计算**，否则"看起来差不多"不算验证（见 `21`）。
+**注入量必须可计算**，否则"看起来差不多"不算验证（见 [21](21-数据质量与一致性校验.md)）。
 
 ### 2.5 `prepare_load.py`：把 CSV 变成 LOAD DATA 能吃的 TSV
 

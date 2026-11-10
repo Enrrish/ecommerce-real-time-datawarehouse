@@ -198,7 +198,7 @@ taskHeap 1489MB，**每 slot 372MB**。
 session 集群 + SQL 提交，作业没有开 `execution.savepoint.path`。
 每次重启都是"重新提交"，也就是从 `scan.startup.mode` 重来。
 
-对 07 这意味着重放 41 万行（1~2 分钟），但换来"重启后自愈"（见 `11` 的僵尸作业）。
+对 07 这意味着重放 41 万行（1~2 分钟），但换来"重启后自愈"（见 [11](11-Flink-CDC.md) 的僵尸作业）。
 对小作业（04/06/09，Kafka 源 `earliest-offset`）意味着重放整个 topic（14.9 万条 / 6.5 分钟），
 且会点亮 `event_age_p99_s` 约 10 分钟 —— 这是**已知的正常现象**。
 

@@ -109,7 +109,7 @@ curl -s -X PATCH "localhost:8081/jobs/<jid>?mode=cancel"
 ⚠️ **不要用算子指标判断作业是否在工作**：
 `vertices[].metrics.read-records` 是缓存快照（可能长期为 0），
 `/vertices/{vid}/metrics?get=0.numRecordsIn` 在 source 上恒为 0。
-判活要看**目标系统的数据**（见 `12`）。
+判活要看**目标系统的数据**（见 [12](12-Flink-状态管理与-Checkpoint.md)）。
 
 ### 1.7 常见故障的因果链
 

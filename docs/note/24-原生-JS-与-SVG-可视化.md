@@ -216,7 +216,7 @@ if (!ONCE) setTimeout(tick, REFRESH_MS);
 → render() 从这一行断掉，8 个面板全停在初始文案
 ```
 
-详见 `23` 的缓存部分。前端能做的防御是**每个面板独立 try/catch**，
+详见 [23](23-HTTP-服务与大屏后端.md) 的缓存部分。前端能做的防御是**每个面板独立 try/catch**，
 一个坏了不影响其它七个。
 
 **坑 3：`fetch` 不判 `res.ok`**

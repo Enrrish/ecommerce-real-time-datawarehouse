@@ -65,7 +65,7 @@ curl -X PUT "http://be:8040/api/{db}/{table}/_stream_load" \
 ...
 ```
 
-版本要 compaction 才能合并（见 `16`）。所以**导入频率有下限**：
+版本要 compaction 才能合并（见 [16](16-Doris-分区-分桶与-Compaction.md)）。所以**导入频率有下限**：
 
 | 频率 | 每小时版本数 | 后果 |
 | --- | --- | --- |
@@ -125,7 +125,7 @@ Flink 的聚合结果是一个 changelog（`+I/-U/+U`）。Doris 的 UNIQUE 表�
 所以 Connector 会在需要时自动插入 `SinkUpsertMaterializer` 算子，
 把 changelog 物化成"最终状态"。代价：多一个算子、多一份状态。
 
-这也是"DWS 必须用 UNIQUE 而不是 AGGREGATE"的原因之一（见 `15`）。
+这也是"DWS 必须用 UNIQUE 而不是 AGGREGATE"的原因之一（见 [15](15-Doris-数据模型.md)）。
 
 ---
 
@@ -184,7 +184,7 @@ checkpoint 间隔 = 数据可见延迟上限。
 | 面板可见 | ≈ ADS + 1.2s | 再加前端轮询 |
 
 **同一句"改一行 MySQL → 大屏可见"有四个不同的数字，取决于走哪条路**。
-不标口径就会吵架（见 `26`）。
+不标口径就会吵架（见 [26](26-时延测量与压测.md)）。
 
 ### 2.4 版本爆炸事故的完整链路
 
@@ -204,12 +204,12 @@ checkpoint 间隔 = 数据可见延迟上限。
 ```
 
 **降延迟的正确做法不是调导入频率**，而是：
-- 大屏侧用 `today` 档单独刷今天那几十行（见 `23`）
+- 大屏侧用 `today` 档单独刷今天那几十行（见 [23](23-HTTP-服务与大屏后端.md)）
 - 或者接受 10 秒的可见延迟
 
 ### 2.5 `INSERT OVERWRITE` 是 Doris 侧的事，不是 Sink
 
-ADS 层不经过 Flink，由大屏后端的 Python 进程执行 `INSERT OVERWRITE`（见 `23`）。
+ADS 层不经过 Flink，由大屏后端的 Python 进程执行 `INSERT OVERWRITE`（见 [23](23-HTTP-服务与大屏后端.md)）。
 两者的区别：
 
 | | Stream Load（Flink Sink） | INSERT OVERWRITE（SQL） |
@@ -220,7 +220,7 @@ ADS 层不经过 Flink，由大屏后端的 Python 进程执行 `INSERT OVERWRIT
 | 版本 | 每次一批一个版本 | 每次刷新一个版本（更大） |
 
 ADS 每 60 秒 `INSERT OVERWRITE` 一次，等于每分钟产生 9 张表的版本 →
-这就是 `trash/` 稳态增长的来源（见 `16`）。
+这就是 `trash/` 稳态增长的来源（见 [16](16-Doris-分区-分桶与-Compaction.md)）。
 
 ### 2.6 踩过的坑
 
