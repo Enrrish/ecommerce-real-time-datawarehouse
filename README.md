@@ -62,7 +62,7 @@ bash scripts/stop.sh
 | 坑 | 不处理的后果 |
 | --- | --- |
 | Kafka topic 必须先建成 **3 分区** | Kafka 会自动建，但建成 **1 分区**。漏斗的会话归因、dup/late 抽样的分区假设全部失效，且**不报任何错** |
-| Doris BE 的 storage 必须用**命名卷** | 挂到宿主机目录时 Docker Desktop 导成 9p，`statvfs` 的 inode 是假数据（可用 inode 为负），BE 判「所有盘都损坏」无限重启。见 `docs/04 §6` |
+| Doris BE 的 storage 必须用**命名卷** | 挂到宿主机目录时 Docker Desktop 导成 9p，`statvfs` 的 inode 是假数据（可用 inode 为负），BE 判「所有盘都损坏」无限重启。见 [docs/04 §6](docs/04-环境搭建.md) |
 | 4 个 slot 装不下 6 个作业 | 订单宽表与日粒度汇总是**一次性**的，`demo.sh` 跑完就取消，把 slot 还给常驻作业 |
 | 重提 `07` 后要等 1~2 分钟快照 | 作业状态立刻变 RUNNING，但 `initial` 快照还没跑完时它一行都不写。**RUNNING 不等于在产出** —— 判据是 `bash scripts/demo-change.sh` 第 0 步的自检（四个源累计读满 40 万行） |
 
@@ -201,7 +201,7 @@ flowchart LR
 | [docs/07-事故库.md](docs/07-事故库.md) | 8 个「不报错但不对」的坑：现象 / 发现 / 根因 / 判据（唯一事实源） |
 | [**docs/note/**](docs/note/README.md) | **技术笔记：28 篇，每项技术先讲通用知识再讲本项目用法** |
 
-> `docs/01`~`07` 回答"为什么这么设计、坑在哪"，`docs/note/` 回答"这个技术怎么用、报错怎么解"。
+> [docs/01](docs/01-架构设计.md)~`07` 回答"为什么这么设计、坑在哪"，`docs/note/` 回答"这个技术怎么用、报错怎么解"。
 > 环境起不来查 note 的 `02`/`03`；作业不写数据查 `11`/`12`；Doris 查询变慢查 `16`；
 > BI 接入与两套内存配置查 `27`/`28`。
 
@@ -241,7 +241,7 @@ flowchart LR
 - Doris 单 BE、单副本（`replication_num=1`）、BE 内存上限 1.75G（活跃数据只有 400MB）
 - Flink 单 TM / **4 slots**，每个作业并行度 1（4 个常驻作业占满），Checkpoint 10s 落本地文件系统
   - 不用 10 slots：TM 的 taskHeap 按 slot 数均分（1489MB ÷ 10 = 149MB），六表 join 跑不动；
-    ÷ 4 = 372MB 才行。降 slot 数比加内存总量对症（见 `docs/04 §6`）
+    ÷ 4 = 372MB 才行。降 slot 数比加内存总量对症（见 [docs/04 §6](docs/04-环境搭建.md)）
 
 ---
 
